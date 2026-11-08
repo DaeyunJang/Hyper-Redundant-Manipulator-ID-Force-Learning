@@ -1,8 +1,8 @@
-"""수동 F/T 무부하 범위와 부하 라벨. 회귀 정답은 바꾸지 않습니다.
+"""Manual F/T no-load ranges and load labels; regression targets stay unchanged.
 
-설정: configs/train.yaml의 ft_sensor_calibration, 각 축 [최솟값, 최댓값].
-실행: python analyze_no_load.py --config configs/train.yaml [--input 기록.csv]
---input은 지정 범위에 대한 기록 통계만 구하며 학습 경계를 자동 변경하지 않습니다.
+Configure ft_sensor_calibration in configs/train.yaml with [minimum, maximum] per axis.
+Run: python analyze_no_load.py --config configs/train.yaml [--input recording.csv]
+--input reports recording statistics for the specified ranges without changing training bounds.
 """
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 
+# AUTHOR: Daeyun
+# Project implementation of manual no-load bounds and load-state labeling.
 def calibrate_no_load(config):
-    """CSV 원값에 적용할 수동 범위를 N 단위로 저장합니다. 교정 CSV를 읽지 않습니다."""
+    """Store manual ranges in N for recorded CSV values; no calibration CSV is read."""
     if 'calibration' in config:
         raise ValueError('Replace legacy calibration with ft_sensor_calibration: unit, fx, fy, fz')
     policy = config.get('ft_sensor_calibration')
@@ -51,7 +53,7 @@ def calibrate_no_load(config):
 
 
 def load_states(force, valid, calibration):
-    """0=무부하, 1=유부하, -2=무효. 과거 bundle만 기존 불확실(-1) 판정을 보존합니다."""
+    """0=unloaded, 1=loaded, -2=invalid; only legacy bundles retain uncertain (-1) labels."""
     force = np.asarray(force, dtype=np.float64)
     valid = np.asarray(valid, dtype=bool)
     if force.ndim != 2 or force.shape[1] != 3 or valid.shape != (len(force),):
@@ -63,7 +65,7 @@ def load_states(force, valid, calibration):
         inside = ((force[valid] >= lower) & (force[valid] <= upper)).all(axis=1)
         result[valid] = np.where(inside, 0, 1)
     elif all(key in calibration for key in ('center_N', 'scale_N', 'off_score', 'on_score')):
-        # 기존 checkpoint 재현 전용. 새 학습은 위의 수동 범위만 사용합니다.
+        # Reproduce legacy checkpoints only; new training uses the manual ranges above.
         score = np.max(np.abs(force[valid] - np.asarray(calibration['center_N'])) /
                        np.asarray(calibration['scale_N']), axis=1)
         state = np.full(len(score), -1, dtype=np.int8)
@@ -80,8 +82,8 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='configs/train.yaml')
-    parser.add_argument('--input', help='선택: 지정한 무부하 범위로 통계를 확인할 CSV')
-    parser.add_argument('--output', help='새 결과 폴더 경로')
+    parser.add_argument('--input', help='Optional CSV for statistics under the specified no-load ranges')
+    parser.add_argument('--output', help='Path to a new output directory')
     args = parser.parse_args(argv)
     config = load_config(args.config)
     report = calibrate_no_load(config)
@@ -110,9 +112,9 @@ def main(argv=None):
     write_json(output / 'analysis.json', report)
     print(output.resolve())
     for axis, low, high in zip(('Fx', 'Fy', 'Fz'), report['lower_N'], report['upper_N']):
-        print(f'{axis} 무부하 범위 [mN]: [{low * 1000:.6f}, {high * 1000:.6f}]')
+        print(f'{axis} no-load range [mN]: [{low * 1000:.6f}, {high * 1000:.6f}]')
     if 'recording' in report:
-        print('기록의 무부하 판정 비율:', report['recording']['unloaded_fraction'])
+        print('Fraction classified as unloaded in this recording:', report['recording']['unloaded_fraction'])
     return output
 
 

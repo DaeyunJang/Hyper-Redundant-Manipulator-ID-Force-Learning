@@ -1,7 +1,8 @@
-"""CSV 열 선택·숫자 행 연결·분할·평가를 모은 공통 코드입니다.
+"""Shared CSV column selection, numeric row compaction, splitting and evaluation.
 
-수정 위치: input_columns/load_trial(입력), prepare_data(분할), force_metrics와
-location_metrics(평가식). 모델과 optimizer는 각각 model_zoo.py와 train.py에 있습니다.
+Input handling: input_columns/load_trial. Splitting: prepare_data.
+Metrics: force_metrics/location_metrics. Models and optimizers are defined in
+model_zoo.py and train.py, respectively.
 """
 from __future__ import annotations
 
@@ -25,9 +26,10 @@ import yaml
 
 from analyze_no_load import calibrate_no_load, load_states
 
-ROOT = Path(__file__).resolve().parent
+# In a frozen build, __file__ points inside the bundle; use the working directory for data/results.
+ROOT = Path.cwd() if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 
-# 이 PC에서만 필요한 드라이버 경로를 현재 프로세스에 적용합니다.
+# Apply the optional local driver workaround to this process only.
 def ensure_driver_runtime():
     root = ROOT
     version_file = Path('/proc/driver/nvidia/version')
@@ -46,10 +48,11 @@ def ensure_driver_runtime():
     env = dict(os.environ)
     env['LD_LIBRARY_PATH'] = str(local) + (':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
     env['HRM_DRIVER_RUNTIME'] = version
-    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    arguments = sys.argv[1:] if getattr(sys, 'frozen', False) else sys.argv
+    os.execve(sys.executable, [sys.executable, *arguments], env)
 
 
-# 확인된 원본 hash에만 적용하는 과거 라벨·파일 역할입니다. 원본 CSV는 수정하지 않습니다.
+# Historical label and file-role contracts apply only to verified hashes; source CSVs stay unchanged.
 DEFAULT_DATA_CONTRACTS = {
     "label_overrides_by_sha256": {
         "269578346b29158aafc7989051c872e71954f91d0a992665cedaf95d11b7c3af": {
@@ -73,7 +76,7 @@ DEFAULT_DATA_CONTRACTS = {
     }
 }
 
-# 이전 설정을 읽기 위한 작은 열 목록. 새 설정은 input_columns에 열을 직접 적습니다.
+# Column groups for older configs; new configs specify columns directly in input_columns.
 FEATURE_GROUPS = {
     'wire_length': [f'wire.Cable #{i} length' for i in range(1, 5)],
     'loadcell_tension': [f'loadcell.Loadcell #{i} tension' for i in range(1, 5)],
@@ -124,7 +127,7 @@ def _path(value, config):
 
 
 def csv_paths(directory):
-    """동일 접두사의 trainN/testN은 숫자순, 그 밖의 파일명은 기존 사전순으로 읽습니다."""
+    """Sort uniform trainN/testN names numerically; preserve lexical order otherwise."""
     paths = sorted(path for path in Path(directory).glob('*.csv') if path.is_file())
     matches = [re.fullmatch(r'(train|test)([0-9]+)', path.stem) for path in paths]
     if matches and all(matches) and len({match.group(1) for match in matches}) == 1:
@@ -133,7 +136,7 @@ def csv_paths(directory):
 
 
 def input_columns(config):
-    """학습·저장·예측에서 동일하게 사용하는 입력 열의 순서입니다."""
+    """Return the input column order shared by training, saved bundles and prediction."""
     columns = config.get('input_columns', config.get('feature_columns'))
     if columns is None:
         columns = [column for group in config.get('feature_groups', ['wire_length', 'loadcell_tension', 'relative_angle'])
@@ -146,7 +149,7 @@ def input_columns(config):
 
 
 def load_config(path):
-    """사용자 YAML을 읽고 재현에 필요한 기본값과 열 순서를 확정합니다."""
+    """Read user YAML and resolve reproducibility defaults and input column order."""
     path = Path(path).resolve()
     config = yaml.safe_load(path.read_text())
     if not isinstance(config, dict):
@@ -202,11 +205,11 @@ def load_config(path):
     ids = config['active_ids']
     if not ids or any(type(i) is not int or i not in range(1, 19) for i in ids) or len(ids) != len(set(ids)):
         raise ValueError('active_ids must contain distinct integer segment IDs in 1..18')
-    calibrate_no_load(config)  # 수동 범위의 단위/하한/상한만 검사하며 CSV를 읽지 않습니다.
+    calibrate_no_load(config)  # Validate manual range units and bounds without reading a CSV.
     return config
 
 
-# 데이터 구조: x/force/timestamps는 결측 제거 후 인덱스, source_rows는 원본 CSV 행 번호입니다.
+# x/force/timestamps use compacted row indices; source_rows preserves original CSV row numbers.
 @dataclass
 class Trial:
     path: str
@@ -262,8 +265,10 @@ def _timestamp(value):
         return None
 
 
+# AUTHOR: Daeyun
+# Project data preparation implementation: numeric row selection and train/validation partitioning.
 def load_trial(path, config, calibration, require_targets=True):
-    """선택 X/Y 숫자 행을 연결합니다. 선택적 comparison_columns는 비교용 행 선택에만 씁니다."""
+    """Compact finite selected X/Y rows; comparison_columns only filters comparison rows."""
     if config.get('preprocessing', 'numeric_compact') != 'numeric_compact':
         raise ValueError('Audited legacy preprocessing requires the archived runner; no automatic policy change')
     path = Path(path).resolve()
@@ -285,7 +290,7 @@ def load_trial(path, config, calibration, require_targets=True):
     force = _number(frame, targets) if has_targets else np.full((len(frame), 3), np.nan)
     label = pd.to_numeric(frame.get(id_column, pd.Series(np.nan, index=frame.index)), errors='coerce').to_numpy(dtype=float)
     x_ok, y_ok = np.isfinite(x).all(1), np.isfinite(force).all(1)
-    # 평가 CSV는 동일한 X/Y 유효 행을 사용하고, 정답 열 자체가 없는 추론은 X만 사용합니다.
+    # Evaluation uses valid X/Y rows; inference without targets uses valid X rows only.
     evaluating = require_targets or (has_targets and y_ok.any())
     keep = x_ok & y_ok if evaluating else x_ok.copy()
     comparison_applied = bool(comparison and evaluating)
@@ -373,7 +378,7 @@ def _reject_duplicates(trials):
 
 
 def prepare_data(config, run_dir=None):
-    """Test 폴더는 고정하고 train 내부에서만 validation을 분리합니다."""
+    """Keep the test directory fixed and derive validation only from training recordings."""
     calibration = calibrate_no_load(config)
     train_root, test_root = _path(config['train_directory'], config), _path(config['test_directory'], config)
     if train_root == test_root:
@@ -433,7 +438,7 @@ def prepare_data(config, run_dir=None):
     declared_tip = {_path(path, config) for path in config.get('tip_train_files', [])}
     if declared_tip - set(development):
         raise ValueError(f'Missing explicitly declared tip files: {declared_tip - set(development)}')
-    # 사용자 지정 train/test를 사용하며, 두 폴더 사이의 X/Y 행 값은 비교하지 않습니다.
+    # Use the user-defined train/test directories without comparing X/Y row values across them.
     audit = {'schema_version': 2, 'feature_columns': input_columns(config),
              'force_columns': config.get('force_columns', [f'fts_kalman.aligned_f{a}' for a in 'xyz']), 'force_unit': 'N', 'force_frame': config.get('force_frame', 'unverified'),
              'source_files': len(trials), 'development_files': len(development), 'test_files': len(tests),
@@ -460,13 +465,13 @@ def prepare_data(config, run_dir=None):
 
 
 def load_prediction_trials(paths, config, calibration):
-    """학습 당시 교정만 사용하며 정답이 없는 입력도 예측할 수 있습니다."""
+    """Use saved training calibration and allow prediction inputs without targets."""
     trials = [load_trial(_path(path, config), config, calibration, require_targets=False) for path in paths]
-    # 예측 중복 경고는 predict.py의 --check-overlap으로 선택하며 파일을 제외하지 않습니다.
+    # predict.py --check-overlap optionally warns about overlap without excluding files.
     return trials
 
 
-# 평가: 힘은 N을 받아 mN 지표를 반환합니다. 위치 확률은 GT로 수정하지 않습니다.
+# Metrics accept forces in N and report mN; ground truth never changes predicted ID probabilities.
 DEFAULT_REGIONS = {
     "lower": list(range(1, 11)),
     "middle": list(range(11, 16)),

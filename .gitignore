@@ -12,6 +12,11 @@
 /results*/
 /runs/
 /checkpoints/
+/build/
+/dist/
+# Keep the optional standalone launcher and build helper local.
+/hrm.py
+/scripts/build_standalone.sh
 *.pt
 *.pth
 *.onnx

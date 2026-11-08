@@ -1,11 +1,11 @@
-# 케이블4 + 로드셀4 + FK 끝단 위치3/회전4 = 15개 입력 (fk_tip_tf 사용)
-# 위치 단위 m, 회전은 quaternion qx/qy/qz/qw입니다. 원값과 부호를 보존합니다.
-# 공통 행 필터 없이 선택한 입력·정답의 빈칸/비수치 행만 제외합니다.
-# 사용자가 바꾸는 학습 설정. 아래 열 이름의 순서가 모델 입력/출력 순서입니다.
+# 4 cable lengths + 4 load cells + 3 FK tip position components / 4 orientation components = 15 inputs (fk_tip_tf)
+# Position is in m; orientation is quaternion qx/qy/qz/qw. Preserve recorded values and signs.
+# Exclude missing/nonnumeric values in selected inputs and targets without a cross-input common-row filter.
+# User-editable training configuration. Column order defines the model input/output order.
 train_directory: datasets/train
 test_directory: datasets/test
 
-# 입력 열: timestamp, ID, 힘 정답은 넣지 않습니다.
+# Input columns: exclude timestamps, IDs, and force targets.
 input_columns:
   - "wire.Cable #1 length"
   - "wire.Cable #2 length"
@@ -23,56 +23,56 @@ input_columns:
   - "fk_tip_tf.qz"
   - "fk_tip_tf.qw"
 
-# 원하는 CSV 열로 바꿀 수 있습니다. 힘 열은 Fx, Fy, Fz 순서의 3개입니다.
+# Select the desired CSV columns. The three force columns must be ordered Fx, Fy, Fz.
 force_columns: [fts_kalman.aligned_fx, fts_kalman.aligned_fy, fts_kalman.aligned_fz]
 id_column: contact_segment_id
-source_force_unit: mN  # mN 또는 N. 내부 학습 단위는 N.
+source_force_unit: mN  # mN or N; training uses N internally.
 force_frame: hrm_base
-force_scope: all_single_contact      # tip: ID18 힘 전용 / all_single_contact: 전체 ID 힘
+force_scope: all_single_contact      # tip: force at ID18 only / all_single_contact: force at any ID
 active_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 regions:
   lower: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
   middle: [11, 12, 13, 14, 15]
   upper: [16, 17, 18]
 
-# 각 CSV의 숫자 행 앞80% 학습 / 뒤20% validation. test 폴더는 그대로 고정.
+# Use the first 80% of numeric rows in each CSV for training and the last 20% for validation; keep the test folder fixed.
 validation_fraction: 0.2
-# 현재 행 포함 30행의 입력 이력. 최적 길이로 검증된 값은 아닙니다.
+# Input history of 30 rows including the current row; this is not a validated optimal length.
 window_samples: 30
 
-# 모든 힘 × ID × 무부하 방식 조합을 새 모델/optimizer로 학습합니다.
+# Train every force x ID x no-load-mode combination with a new model and optimizer.
 force_candidates: [mlp, cnn, convmixer, resnet, lstm, gru, tcn, transformer, kalmannet, small_gru, residual_tcn]
 location_candidates: [mlp, cnn, convmixer, resnet, lstm, gru, tcn, transformer, kalmannet, small_gru, residual_tcn]
 no_load_modes: [masked, class0]
-# 예: force_params: {cnn: {channels: 32, kernel_size: 3, num_layers: 2}}
+# Example: force_params: {cnn: {channels: 32, kernel_size: 3, num_layers: 2}}
 force_params: {}
 location_params: {}
-force_loss: mse       # 힘 회귀 손실: mse(제곱 오차) 또는 smooth_l1
-target_scaling: true  # 학습 데이터의 평균/표준편차로 힘을 정규화; 저장/예측 시 역변환
+force_loss: mse       # Force regression loss: mse (squared error) or smooth_l1
+target_scaling: true  # Normalize force using training mean/std; invert the transform for saved outputs and predictions
 
-# 무부하 판정: force_columns의 CSV 값과 [최솟값, 최댓값]을 직접 비교합니다.
-# 세 축 모두 범위 안(경계 포함)이면 무부하, 한 축이라도 밖이면 유부하입니다.
-# 평균/offset 차감, 자동 범위 계산, 10% 확대, 중간 불확실 구간은 없습니다.
-# 초기값은 기존 무부하 범위를 CSV 좌표로 옮긴 값입니다. 0 중심 ±150이면 [-150, 150].
-# 이 설정은 ID 라벨만 결정하며 힘 회귀 정답의 값/부호를 바꾸지 않습니다.
+# No-load detection: compare CSV values in force_columns directly with [minimum, maximum].
+# Unloaded if all three axes are within their inclusive bounds; loaded if any axis is outside.
+# No mean/offset subtraction, automatic bounds, 10% expansion, or intermediate uncertain region.
+# Initial bounds map the previous no-load ranges into CSV coordinates; zero-centered +/-150 means [-150, 150].
+# These bounds determine ID labels only; force regression targets and signs are unchanged.
 ft_sensor_calibration:
-  unit: mN  # 아래 범위의 단위(mN 또는 N). CSV 단위는 위 source_force_unit.
+  unit: mN  # Unit of the bounds below (mN or N); source_force_unit defines the CSV unit.
   fx: [-134.326, 134.326]
   fy: [-126.814, 126.814]
   fz: [-192.670, 192.670]
 
-max_epochs: 60            # 모델당 최대 학습 반복 횟수
-patience: 10              # validation 개선이 없는 횟수가 이 값에 도달하면 조기 종료
-batch_size: 1024          # 한 번에 처리할 입력 창 수
-learning_rate: 0.001      # 가중치를 갱신하는 학습률
-weight_decay: 0.0001      # 큰 가중치를 억제하는 정규화 강도
-gradient_clip_norm: 1.0   # 너무 큰 gradient를 제한하는 값
-seed: 42                 # 초기화/학습 순서의 난수 기준
-threads: 4               # CPU 연산 스레드 수
-cudnn_deterministic: false # GPU 연산을 결정적 알고리즘으로 제한할지
-cudnn_benchmark: true      # GPU 연산 알고리즘의 속도를 측정해 선택할지
+max_epochs: 60            # Maximum epochs per model
+patience: 10              # Stop after this many epochs without validation improvement
+batch_size: 1024          # Number of input windows per batch
+learning_rate: 0.001      # Learning rate for weight updates
+weight_decay: 0.0001      # Weight-decay regularization strength
+gradient_clip_norm: 1.0   # Maximum gradient norm
+seed: 42                 # Random seed for initialization and training order
+threads: 4               # Number of CPU threads
+cudnn_deterministic: false # Use deterministic cuDNN algorithms
+cudnn_benchmark: true      # Benchmark GPU kernels to select an implementation
 
-# 학습 후 validation.xlsx 생성 여부. predict.py는 predictions.xlsx를 자동 생성합니다.
+# Export validation.xlsx after training; predict.py automatically exports predictions.xlsx.
 export_excel: true
 test_evaluation_scope: held_out_whole_recordings_per_contact_id
 

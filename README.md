@@ -1,12 +1,12 @@
-# HRM 외력·접촉 위치 추정
+# HRM External Force and Contact Location Estimation
 
-CSV 입력으로 Fx/Fy/Fz와 접촉 ID를 학습하고, test 예측을 Excel과 그림으로 저장합니다.
-실행 코드는 루트 Python 파일, 설정은 `configs/`, 데이터는 `datasets/train`과 `datasets/test`에 있습니다.
-아래 명령은 프로젝트 루트의 같은 Bash 터미널에서 실행합니다.
+Train Fx/Fy/Fz regression and contact-ID classification models from CSV inputs, then export test predictions to Excel and figures.
+Python source files are in the project root, configurations are in `configs/`, and data are in `datasets/train` and `datasets/test`.
+Run the commands below from the project root in the same Bash terminal.
 
-## 내려받기와 환경 설치
+## Download and install
 
-Git, Git LFS, `uv`가 필요합니다. CSV 전체 다운로드 크기는 약 **3.57 GB**입니다.
+Git, Git LFS, and `uv` are required. The complete CSV download is approximately **3.57 GB**.
 
 ```bash
 git lfs install
@@ -17,59 +17,60 @@ git lfs pull
 bash scripts/setup_environment.sh
 ```
 
-설치 스크립트는 Python 3.10 환경 `env_hrm_force_estimation`과 PyTorch 2.7.1/CUDA 12.6,
-`requirements.txt`의 패키지를 설치합니다. GPU를 사용하려면 호환되는 NVIDIA 드라이버가 필요합니다.
-이후 Python 명령은 `bash scripts/hrm_python.sh ...`로 실행합니다.
+The setup script creates the Python 3.10 environment `env_hrm_force_estimation` and installs
+PyTorch 2.7.1/CUDA 12.6 and the packages in `requirements.txt`. GPU execution requires a compatible NVIDIA driver.
+Use `bash scripts/hrm_python.sh ...` for subsequent Python commands.
 
-| 데이터 경로 | CSV 수 | 크기 |
+| Data path | CSV files | Size |
 |---|---:|---:|
-| `datasets/train/train1.csv` ~ `train40.csv` | 40 | 약 3.20 GB |
-| `datasets/test/test1.csv` ~ `test18.csv` | 18 | 약 369.58 MB |
+| `datasets/train/train1.csv` through `train40.csv` | 40 | Approx. 3.20 GB |
+| `datasets/test/test1.csv` through `test18.csv` | 18 | Approx. 369.58 MB |
 
-파일 번호는 접촉 ID가 아닙니다. 라벨은 CSV의 `contact_segment_id`에서 읽습니다.
-원래 파일명·접촉 ID·SHA256은 [datasets/file_names.csv](datasets/file_names.csv)에 기록했습니다.
-접촉 ID 1–18마다 동적 녹화 CSV 한 개씩을 통째로 test에 배정했습니다.
-좌·우 방향은 각각 9개(seed 42)이며, 나머지 동적 22개와 정적 18개는 train에 있습니다.
-같은 원본 녹화를 train과 test에 함께 넣지 않으며, CSV 내용은 변경하지 않았습니다.
-**이 분할로 처음부터 학습한 모델을 평가하세요.** 이전 분할로 학습한 모델은 재사용하지 않습니다.
-CSV 대신 몇 줄짜리 LFS 포인터만 보이면 `git lfs pull`을 다시 실행하세요.
+File numbers are not contact IDs. Labels come from the CSV column `contact_segment_id`.
+Original filenames, contact IDs, and SHA256 hashes are listed in [datasets/file_names.csv](datasets/file_names.csv).
+One complete dynamic recording per contact ID 1–18 is assigned to test: nine left-side and nine right-side recordings (seed 42).
+Training uses the remaining 22 dynamic recordings and 18 static recordings.
+The same original recording is not assigned to both train and test; CSV contents are preserved.
+**Evaluate models trained from scratch on this split.** Do not reuse models trained on the earlier split.
+If a CSV contains only a short LFS pointer, run `git lfs pull` again.
 
-## 설정과 데이터 확인
+## Configure and check data
 
-기본 설정은 [configs/train.yaml](configs/train.yaml)입니다. 실행 전에 다음 항목을 확인하세요.
+The default configuration is [configs/train.yaml](configs/train.yaml). Review these fields before running:
 
-- `input_columns`, `force_columns`, `id_column`: 사용할 CSV 열과 순서.
-- `source_force_unit`, `force_scope`, `ft_sensor_calibration`: 힘 단위·학습 범위·무부하 판정 범위.
-- `force_candidates`, `location_candidates`, `no_load_modes`: 학습할 모델과 방식.
-- `window_samples`, `validation_fraction`, `batch_size`, `max_epochs`: 시간창·분할·학습 크기.
+- `input_columns`, `force_columns`, `id_column`: CSV columns and their order.
+- `source_force_unit`, `force_scope`, `ft_sensor_calibration`: force units, regression scope, and no-load bounds.
+- `force_candidates`, `location_candidates`, `no_load_modes`: model architectures and no-load handling modes.
+- `window_samples`, `validation_fraction`, `batch_size`, `max_epochs`: history length, validation split, batch size, and epoch limit.
 
-현재 기본 입력은 케이블 길이 4개, 장력 4개, 상대각 18개입니다.
-기본 힘 범위는 `all_single_contact`, 시간창은 30행, validation은 각 train CSV의 뒤 20%입니다.
-원본 CSV는 수정하지 않으며 선택한 입력·정답 열의 비수치/결측 행을 제외합니다.
+Default inputs are four cable lengths, four tensions, and 18 relative angles.
+The default force scope is `all_single_contact`, the input window contains 30 rows,
+and validation uses the last 20% of numeric rows in each training CSV.
+Original CSV files remain unchanged. Rows with missing or nonnumeric values in selected input/target columns are excluded.
 
 ```bash
-# 모델 학습 없이 데이터와 분할만 확인합니다. 확인용 출력 폴더는 생성됩니다.
+# Check data and splits without training a model; a diagnostic output folder is created.
 bash scripts/hrm_python.sh train.py --config configs/train.yaml --check-data
 
-# YAML에 지정한 무부하 범위를 확인합니다.
+# Inspect the no-load bounds specified in YAML.
 bash scripts/hrm_python.sh analyze_no_load.py --config configs/train.yaml
 ```
 
-입력 구성을 바꾸려면 `--config`에 다음 파일 중 하나를 지정합니다.
+Select another input configuration with `--config`:
 
-| 설정 파일 (`configs/` 아래) | 입력 |
+| Configuration file (under `configs/`) | Inputs |
 |---|---|
-| `train_cable_loadcell.yaml` | 케이블 길이 + 장력 |
-| `train_cable_angle.yaml` | 케이블 길이 + 상대각 |
-| `train_loadcell_angle.yaml` | 장력 + 상대각 |
-| `train_cable_loadcell_angle.yaml` | 케이블 길이 + 장력 + 상대각 |
-| `train_cable_loadcell_estimated_pose.yaml` | 케이블 길이 + 장력 + Estimated 자세 |
-| `train_cable_loadcell_fk_tip_tf.yaml` | 케이블 길이 + 장력 + FK 자세 |
+| `train_cable_loadcell.yaml` | Cable lengths + tensions |
+| `train_cable_angle.yaml` | Cable lengths + relative angles |
+| `train_loadcell_angle.yaml` | Tensions + relative angles |
+| `train_cable_loadcell_angle.yaml` | Cable lengths + tensions + relative angles |
+| `train_cable_loadcell_estimated_pose.yaml` | Cable lengths + tensions + estimated tip pose |
+| `train_cable_loadcell_fk_tip_tf.yaml` | Cable lengths + tensions + FK tip pose |
 
-## 학습
+## Train
 
-처음에는 MLP 힘 모델과 MLP 위치 모델, `class0` 한 조합을 1 epoch 실행해 흐름을 확인하세요.
-이 명령도 전체 지정 데이터의 준비와 학습·validation Excel 생성을 수행합니다.
+Start with one MLP force model, one MLP location model, and the `class0` mode for one epoch.
+This command prepares the full configured dataset, trains the pair, and exports validation results to Excel.
 
 ```bash
 HRM_RUN="run_$(date +%Y%m%d_%H%M%S)"
@@ -78,20 +79,20 @@ bash scripts/hrm_python.sh train.py --config configs/train.yaml \
   --output "results/train/$HRM_RUN"
 ```
 
-전체 비교가 필요할 때는 아래 명령을 별도로 실행합니다.
-기본값은 **힘 11종 × 위치 11종 × 2방식 = 242조합**, 모델당 최대 60 epoch이므로
-단일 조합 확인보다 시간과 저장 공간이 많이 필요합니다.
+Run the following command separately for the complete comparison.
+The default **11 force architectures × 11 location architectures × 2 modes = 242 combinations**,
+with up to 60 epochs per model, require more time and storage than the single-pair check.
 
 ```bash
 bash scripts/hrm_python.sh train.py --config configs/train.yaml \
   --output "results/train/${HRM_RUN}_all"
 ```
 
-학습 폴더에는 조합별 `hrm_bundle.pt`, `validation.xlsx`, 비교표와 사용 설정이 저장됩니다.
-다음 예측 명령은 첫 단일 조합 학습을 사용합니다. 전체 비교 모델을 사용하려면
-`HRM_RUN="${HRM_RUN}_all"`로 바꾸세요. 새 실행에는 새로운 이름을 사용합니다.
+The training folder contains a `hrm_bundle.pt` for each pair, `validation.xlsx`, comparison tables, and the resolved configuration.
+The prediction commands below use the first single-pair run. To use the full comparison instead,
+set `HRM_RUN="${HRM_RUN}_all"`. Use a new output name for every run.
 
-## Test 예측과 Excel 정리
+## Predict test data and organize Excel results
 
 ```bash
 bash scripts/hrm_python.sh predict.py --train-dir "results/train/$HRM_RUN" \
@@ -104,45 +105,46 @@ bash scripts/hrm_python.sh analysis.py "results/predict/$HRM_RUN" \
   --output "results/analysis/$HRM_RUN"
 ```
 
-`predict.py --train-dir`는 학습 폴더의 완료된 조합과 저장된 설정을 사용합니다.
-저장된 `test_directory`에 현재 존재하는 CSV 전체를 읽으며, 현재 YAML로 모델 설정을 바꾸지 않습니다.
-출력 폴더에는 `predictions.xlsx`, `predictions.csv`, `metrics.json` 등이 생성됩니다.
+`predict.py --train-dir` evaluates completed model pairs using their saved configuration.
+It reads all CSV files currently in the saved `test_directory`; it does not replace model settings with the current YAML.
+If you move a training folder to another computer, pass `--input-dir datasets/test` to specify the new test location.
+Outputs include `predictions.xlsx`, `predictions.csv`, and `metrics.json`.
 
-`organize_results.py`는 예측 Excel을 읽어 입력 옆 새 `organized_*` 폴더에 힘·ID Excel을 만듭니다.
-`--id-tolerance 0`은 정확 ID, `2`는 ±2 기준입니다. 저장된 예측값은 바꾸지 않습니다.
-`analysis.py`는 predict 폴더를 읽어 `force_and_id_all_combinations.xlsx`와 비교 그림을 만듭니다.
-이 두 단계는 모델을 다시 실행하지 않습니다. 여러 입력 실행을 비교할 때는 폴더들을 함께 지정하세요.
+`organize_results.py` reads prediction Excel files and creates force/ID workbooks in a new adjacent `organized_*` folder.
+`--id-tolerance 0` requires the exact ID; `2` allows a distance of ±2. Saved predictions are preserved.
+`analysis.py` reads prediction folders and creates `force_and_id_all_combinations.xlsx` and comparison figures.
+Neither step runs the models again. To compare multiple input configurations, pass their result folders together:
 
 ```bash
-bash scripts/hrm_python.sh analysis.py results/predict/실행A results/predict/실행B
+bash scripts/hrm_python.sh analysis.py results/predict/run_A results/predict/run_B
 ```
 
-예측과 Excel 정리를 한 번에 하려면 개별 명령 대신 아래 스크립트를 사용할 수 있습니다.
+To run prediction and Excel organization in sequence, use this wrapper instead of the separate commands:
 
 ```bash
 bash scripts/predict_and_organize.sh "results/train/$HRM_RUN" \
   "results/predict/${HRM_RUN}_organized" --id-tolerance 2
 ```
 
-## MATLAB 그림과 주요 파일
+## MATLAB figures and main files
 
-MATLAB R2020b 이상에서 프로젝트 폴더를 열고 필요한 스크립트를 실행합니다.
+Open the project folder in MATLAB R2020b or later and run the desired script:
 
 ```matlab
-run('analyze_matlab.m')  % organize가 만든 force-estimation_*.xlsx 선택
-run('plot_analysis.m')   % analysis가 만든 force_and_id_all_combinations.xlsx 선택
+run('analyze_matlab.m')  % Select force-estimation_*.xlsx produced by organize_results.py.
+run('plot_analysis.m')   % Select force_and_id_all_combinations.xlsx produced by analysis.py.
 ```
 
-스크립트 상단에서 파일·ID 범위·그림 옵션을 바꿀 수 있습니다.
-MATLAB은 저장된 Excel을 사용하며, 출력은 입력 Excel 옆 새 파일/폴더에 저장합니다.
+Edit file paths, ID ranges, and figure options at the top of each script.
+MATLAB reads saved Excel files and writes new files/folders next to the input workbook.
 
-| 파일 | 역할 |
+| File | Purpose |
 |---|---|
-| `train.py`, `model_zoo.py`, `data_utils.py` | 학습, 모델 정의, CSV 처리 |
-| `predict.py` | 저장 모델의 test 예측 |
-| `analyze_no_load.py` | 무부하 범위 확인과 선택 CSV 통계 |
-| `organize_results.py`, `analysis.py` | 저장 Excel 정리와 분석 |
-| `analyze_matlab.m`, `plot_analysis.m` | Excel 기반 MATLAB 분석·그림 |
-| `configs/*.yaml`, `requirements.txt`, `scripts/*.sh` | 실행 설정, 의존성, 환경/실행 도구 |
+| `train.py`, `model_zoo.py`, `data_utils.py` | Training, model definitions, and CSV processing |
+| `predict.py` | Test prediction with saved models |
+| `analyze_no_load.py` | No-load bounds and optional CSV statistics |
+| `organize_results.py`, `analysis.py` | Excel organization and analysis |
+| `analyze_matlab.m`, `plot_analysis.m` | MATLAB analysis and figures from Excel |
+| `configs/*.yaml`, `requirements.txt`, `scripts/*.sh` | Configuration, dependencies, and environment/run tools |
 
-모든 Python 도구는 `--help`로 실행 옵션을 확인할 수 있습니다.
+All Python tools support `--help`.

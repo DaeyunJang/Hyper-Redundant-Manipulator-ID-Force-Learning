@@ -1,7 +1,7 @@
-"""저장 모델로 CSV를 예측하고 비교표·요약·모델별 Excel을 만듭니다.
+"""Predict from CSV files with saved models and export comparisons, summaries and model sheets.
 
-전체 test 흐름: select_and_evaluate. 예측 계산: predict_trials.
-Excel 열/시트 수정: _branch_export_frame / ModelWorkbook.
+Test workflow: select_and_evaluate. Prediction computation: predict_trials.
+Excel columns and sheets: _branch_export_frame / ModelWorkbook.
 """
 
 from __future__ import annotations
@@ -52,7 +52,8 @@ def fresh_directory(*args, **kwargs):
 DEFAULT_FORCE_TOLERANCE_MN = 1e-3
 
 
-# 저장 당시 데이터·모델 계약을 복원하고 원본 행에 예측을 대응합니다.
+# AUTHOR: Daeyun
+# Restore saved data/model contracts and align predictions with source rows.
 def _path(value: str | Path, bundle: dict) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (Path(bundle["config"].get("project_root", ROOT)) / path).resolve()
@@ -70,7 +71,7 @@ def _tip_verified(trial: Any, bundle: dict) -> bool:
 
 
 def _warn_prediction_overlap(trials: list, bundle: dict) -> None:
-    """선택 검사: 저장 메타데이터의 중복 징후만 알리며 입력/예측은 바꾸지 않습니다."""
+    """Optionally flag overlap in saved metadata without changing inputs or predictions."""
     known = _known_trials(bundle)
     indices = set(bundle.get('split', {}).get('train', [])) | set(bundle.get('split', {}).get('validation', []))
     references = [('train/validation', known[i]) for i in sorted(indices)
@@ -82,20 +83,20 @@ def _warn_prediction_overlap(trials: list, bundle: dict) -> None:
         for role, info in references:
             previous = info.get('timestamp_origin_ns')
             if trial.sha256 == info.get('sha256'):
-                reason = '파일 내용 동일'
+                reason = 'identical file contents'
             elif (isinstance(origin, int) and origin > 0 and isinstance(previous, int) and previous > 0
                   and info.get('rows') == len(trial.x) and abs(previous - origin) <= 20000):
-                reason = '중복 의심: 시작 시각·유효 행 수 일치'
+                reason = 'possible overlap: matching start timestamp and valid-row count'
             else:
                 continue
-            matches.append(f"{role}: {info.get('path', '(저장 경로 없음)')} ({reason})")
+            matches.append(f"{role}: {info.get('path', '(no saved path)')} ({reason})")
         if trial.sha256 in protected and not matches:
-            matches.append('과거 학습/validation 파일 hash와 동일')
+            matches.append('matches a previous training/validation file hash')
         if matches:
-            # warnings.warn 대신 stderr에 출력하므로 PYTHONWARNINGS=error여도 실행을 막지 않습니다.
-            print(f"[경고] 데이터 중복 검사: {trial.path}\n  " + '\n  '.join(matches)
-                  + '\n  파일을 제외하지 않고 예측을 계속합니다.', file=sys.stderr, flush=True)
-        references.append(('예측 입력', trial.info))
+            # Write to stderr so PYTHONWARNINGS=error does not stop prediction.
+            print(f"[WARNING] Data overlap check: {trial.path}\n  " + '\n  '.join(matches)
+                  + '\n  Continuing prediction without excluding the file.', file=sys.stderr, flush=True)
+        references.append(('prediction input', trial.info))
 
 
 def _initial_frame(trial: Any, bundle: dict, checkpoint: Path) -> pd.DataFrame:
@@ -280,7 +281,7 @@ def prediction_report(frame: pd.DataFrame, bundle: dict, optimized_regions: dict
     return report
 
 
-# 최선 조합은 validation만으로 선택합니다.
+# Select the best combination using validation results only.
 def select_comparison_rows(comparison: pd.DataFrame, force_tolerance_mN: float = DEFAULT_FORCE_TOLERANCE_MN,
                            location_metric: str = 'location_macro_recall') -> list[tuple[int, pd.Series]]:
     """Select one existing pair per mode using validation columns only.
@@ -340,10 +341,10 @@ def _sha256(path: str | Path) -> str:
 
 def _checkpoint_path(train_dir: Path, row: pd.Series) -> Path:
     value = Path(row["bundle"])
-    candidates = [value] if value.is_absolute() else [ROOT / value, train_dir / value]
-    candidates.append(train_dir / "models" / (
+    candidates = [train_dir / "models" / (
         f"{row['mode']}__force_{row['force_model']}__location_{row['location_model']}"
-    ) / "hrm_bundle.pt")
+    ) / "hrm_bundle.pt"]
+    candidates.extend([value] if value.is_absolute() else [ROOT / value, train_dir / value])
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -413,7 +414,7 @@ def representative_comparison_rows(comparison: pd.DataFrame, config: dict) -> li
     return result
 
 
-# Excel을 행 단위로 저장하며 모델별 시트와 출처/비교 시트를 한 파일에 모읍니다.
+# Stream Excel rows and collect model, provenance and comparison sheets in one workbook.
 class ModelWorkbook:
     """Small row-major XLSX writer; cells with missing values remain blank."""
 
@@ -690,9 +691,11 @@ def export_validation_workbook(train_dir: str | Path) -> Path:
     return path
 
 
-def _test_trials(bundle: dict, check_overlap: bool = False) -> list:
-    """현재 test 폴더의 CSV 전체를 저장된 전처리·교정 기준으로 읽습니다."""
-    directory = _path(bundle["config"].get("test_directory", "datasets/test"), bundle)
+def _test_trials(bundle: dict, check_overlap: bool = False,
+                 input_dir: str | Path | None = None) -> list:
+    """Read all CSV files in the current test directory using saved preprocessing and calibration."""
+    directory = (Path(input_dir).resolve() if input_dir is not None else
+                 _path(bundle["config"].get("test_directory", "datasets/test"), bundle))
     paths = csv_paths(directory)
     if not paths:
         raise ValueError(f"No CSV files found in test directory: {directory}")
@@ -724,10 +727,11 @@ def _verify_unchanged(trials: list) -> None:
             raise ValueError(f"Input CSV changed during prediction/export: {trial.path}")
 
 
-# 전체 실행: 모든 완료 조합 test 평가 → 대표 모델 시트 → 선택 모델 요약.
+# Full workflow: evaluate completed combinations, export representative sheets, summarize selected models.
 def select_and_evaluate(train_dir: str | Path, output: str | Path | None = None,
                         device: str | None = None, location_metric: str = "location_macro_recall",
-                        check_overlap: bool = False) -> Path:
+                        check_overlap: bool = False,
+                        input_dir: str | Path | None = None) -> Path:
     """Evaluate every completed pair; the best pair per mode is frozen by validation."""
     train_dir = Path(train_dir).resolve()
     comparison = _completed_comparison(train_dir)
@@ -739,8 +743,9 @@ def select_and_evaluate(train_dir: str | Path, output: str | Path | None = None,
     _assert_bundle_row(reference, comparison.iloc[0])
     signature = _contract(reference)
     jobs = representative_comparison_rows(comparison, reference["config"])
-    trials = _test_trials(reference, check_overlap=check_overlap)
-    test_directory = _path(reference["config"].get("test_directory", "datasets/test"), reference)
+    trials = _test_trials(reference, check_overlap=check_overlap, input_dir=input_dir)
+    test_directory = (Path(input_dir).resolve() if input_dir is not None else
+                      _path(reference["config"].get("test_directory", "datasets/test"), reference))
     print(f"Test CSV: {len(trials)} files in {test_directory}", flush=True)
     destination = fresh_directory("predict", output)
     writer = ModelWorkbook(destination / "predictions.xlsx", comparison)
@@ -873,17 +878,17 @@ def main(argv: list[str] | None = None) -> None:
     choice = parser.add_mutually_exclusive_group(required=True)
     choice.add_argument("--checkpoint")
     choice.add_argument("--train-dir", help="Evaluate every completed bundle; best models are selected by validation")
-    parser.add_argument("--input-dir", default="datasets/test")
+    parser.add_argument("--input-dir", help="CSV directory override; default: saved test directory for --train-dir, datasets/test for --checkpoint")
     parser.add_argument("--output")
     parser.add_argument("--device", choices=["cpu", "cuda"])
     parser.add_argument("--check-overlap", action="store_true",
-                        help="중복 파일/시작 시각·행 수 일치를 경고만 하고 계속 예측합니다 (기본: 검사 생략)")
+                        help="warn about duplicate files or matching start timestamps/row counts and continue prediction (default: skip check)")
     parser.add_argument("--location-selection-metric", default="location_macro_recall",
                         choices=["location_macro_recall", "load_balanced_accuracy"])
     args = parser.parse_args(argv)
     destination = (select_and_evaluate(args.train_dir, args.output, args.device, args.location_selection_metric,
-                                       check_overlap=args.check_overlap) if args.train_dir else
-                   predict_checkpoint(args.checkpoint, args.input_dir, args.output, args.device,
+                                       check_overlap=args.check_overlap, input_dir=args.input_dir) if args.train_dir else
+                   predict_checkpoint(args.checkpoint, args.input_dir or "datasets/test", args.output, args.device,
                                       check_overlap=args.check_overlap))
     print(f"Predictions, comparison and Excel: {destination}")
 

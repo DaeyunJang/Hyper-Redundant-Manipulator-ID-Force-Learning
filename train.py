@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""HRM 학습: 데이터 준비 → 독립 힘/ID 조합 학습 → 검증·모델·Excel 저장.
+"""Train HRM models: prepare data, fit independent force/ID branches, save results.
 
-사용자 설정은 configs/train.yaml. 모델 정의는 model_zoo.py에 있습니다.
---check-data는 모델 생성/학습 없이 입력 파일과 분할만 확인합니다.
+User settings are in configs/train.yaml; model definitions are in model_zoo.py.
+--check-data validates input files and splits without constructing or training models.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from torch.nn import functional as F
 from model_zoo import build_estimator, MODEL_NAMES
 
 
-# 저장 경로와 재현 가능한 초기화
+# Output paths and reproducible initialization.
 def fresh_directory(kind, explicit=None):
     path = Path(explicit) if explicit else ROOT / 'results' / kind / datetime.now().strftime('%Y%m%d_%H%M%S')
     path.mkdir(parents=True, exist_ok=False)
@@ -50,7 +50,7 @@ def seed_all(seed, threads=4, deterministic=False, benchmark=True):
     torch.backends.cuda.matmul.allow_tf32 = False
 
 
-# 정규화와 파일/역할 경계를 넘지 않는 입력 창
+# Normalization and input windows that stay within file and split boundaries.
 def fit_scaler(trials, indices, scope):
     """Fit once on valid raw train rows, never on repeated overlapping windows."""
     selected = [trials[i] for i in indices if scope != 'tip' or trials[i].is_tip]
@@ -157,7 +157,8 @@ def validate_branch(net, store, batch_size):
     return math.sqrt(metric) * 1000 if store.branch == 'force' else metric
 
 
-# 이 함수에서 optimizer/loss/early stopping을 수정합니다.
+# AUTHOR: Daeyun
+# Project training implementation: optimizer, loss and early stopping.
 def train_branch(net, train, val, cfg, seed, progress_name):
     """New optimizer on every call; no reuse, resume, or sibling forward."""
     seed_all(seed, cfg.get('threads', 4), cfg.get('cudnn_deterministic', False), cfg.get('cudnn_benchmark', True))
@@ -223,7 +224,7 @@ def predict_branch(net, store, batch_size):
     return np.concatenate(outputs)
 
 
-# 가중치뿐 아니라 추론에 필요한 정규화·입력 순서·교정도 함께 저장합니다.
+# Save normalization, input order and calibration alongside the model weights.
 def bundle_for(model, cfg, prepared, scalers, stats, mode, force_name, location_name):
     return {'schema_version': 2, 'kind': 'independent_hrm', 'mode': mode,
             'force_name': force_name, 'location_name': location_name,
@@ -245,7 +246,7 @@ def restore_bundle(path, device='cpu'):
     if bundle.get('kind') != 'independent_hrm':
         raise ValueError('Expected an independent HRM bundle')
     cfg = bundle['config']
-    # 옵션이 없던 과거 bundle은 audited 정책이었다. 새 전처리로 조용히 바꾸지 않는다.
+    # Older bundles without this option used audited preprocessing; preserve that policy.
     cfg.setdefault('preprocessing', 'audited')
     cfg.setdefault('tip_scope_by_id', False)
     # Match training execution/precision policy without reseeding caller RNGs.
@@ -262,7 +263,7 @@ def restore_bundle(path, device='cpu'):
     return model, bundle
 
 
-# 전체 실행 흐름: 유지보수할 때 여기부터 읽으세요.
+# Main training workflow: start here when modifying the experiment runner.
 def train_experiment(config_path, output=None, epochs=None, models=None, modes=None, check_data=False):
     cfg = load_config(config_path)
     if epochs is not None:
@@ -367,7 +368,7 @@ def train_experiment(config_path, output=None, epochs=None, models=None, modes=N
                 pd.DataFrame(rows).to_csv(outdir / 'comparison.csv', index=False)
                 write_json(outdir / 'progress.json', {'complete': len(rows), 'total': total, 'last': name})
                 del model
-    # 모델 선택은 validation으로 고정한다. Test 파일은 여기서 평가하지 않는다.
+    # Select models using validation only. Test files are not evaluated here.
     from predict import select_comparison_rows, export_validation_workbook
     comparison = pd.DataFrame(rows)
     selected = select_comparison_rows(comparison)

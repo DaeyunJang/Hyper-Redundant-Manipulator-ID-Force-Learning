@@ -1,7 +1,7 @@
-"""저장된 predict 결과 → 힘/ID 지표·조합별 GT/예측 통합 Excel + 그림. 학습·추론·원본 CSV 재로딩 없음.
+"""Analyze saved prediction results: force/ID metrics, combined GT/prediction workbooks and plots; no training, inference or source CSV reload.
 
-bash scripts/hrm_python.sh analysis.py results/predict/실행폴더
-bash scripts/hrm_python.sh analysis.py 'results/predict/날짜시간_*'
+bash scripts/hrm_python.sh analysis.py results/predict/run_directory
+bash scripts/hrm_python.sh analysis.py 'results/predict/date_time_*'
 """
 from __future__ import annotations
 
@@ -47,7 +47,10 @@ def percent(numerator: float, denominator: float) -> float:
 
 
 def pool_force(files: list[dict], state: str = "all") -> dict:
-    """파일별 RMSE를 표본 수와 제곱오차로 합친다. N=0은 평가 불가다."""
+    """Pool file-level RMSE using sample counts and squared errors; N=0 is not evaluable.
+
+    AUTHOR: Daeyun
+    """
     prefix = "" if state == "all" else state + "_"
     supported = [(int(m[prefix + "force_support"]), m) for m in files]
     supported = [(n, m) for n, m in supported if n > 0]
@@ -61,7 +64,7 @@ def pool_force(files: list[dict], state: str = "all") -> dict:
                 continue
             values = np.array([m.get(prefix + "force_" + key, np.nan) for _, m in supported], dtype=float)
             if not np.isfinite(values).all():
-                raise ValueError(f"양수 force_support에 {prefix + key}가 없습니다.")
+                raise ValueError(f"Positive force_support requires {prefix + key}.")
             weights = np.array([n for n, _ in supported])
             result[key] = float(np.sqrt(np.average(values ** 2, weights=weights)) if metric == "rmse"
                                 else np.average(values, weights=weights))
@@ -69,12 +72,12 @@ def pool_force(files: list[dict], state: str = "all") -> dict:
 
 
 def final_confusion(report: dict, mode: str) -> tuple[np.ndarray, np.ndarray]:
-    """Masked의 위치 argmax / Class0의 ID0 포함 최종 출력."""
+    """Use the Masked location argmax or final Class0 output including ID0."""
     saved = report["system_confusion" if mode == "class0" else "conditional_confusion"]
     labels = np.asarray(saved["labels"], dtype=int)
     matrix = np.asarray(saved["matrix"], dtype=np.int64)
     if not saved.get("available", True) or matrix.shape != (len(labels), len(labels)):
-        raise ValueError(f"{mode}의 저장 혼동행렬이 없거나 크기가 맞지 않습니다.")
+        raise ValueError(f"The saved {mode} confusion matrix is missing or has the wrong shape.")
     return labels, matrix
 
 
@@ -86,7 +89,7 @@ def id_scores(labels: np.ndarray, matrix: np.ndarray, ids: set, tolerances: list
     distance = np.abs(labels[rows, None] - labels[None, :])
     result = {"n_loaded": total, "supported_ids": int((support > 0).sum())}
     for tolerance in tolerances:
-        # ID0은 물리 위치가 아니므로 GT1과 가깝더라도 항상 실패다.
+        # ID0 is not a physical location, so it is always incorrect, even when close to GT1.
         hit = (counts * ((labels[None, :] > 0) & (distance <= tolerance))).sum(axis=1)
         result[f"hits_tol{tolerance}"] = int(hit.sum())
         result[f"accuracy_tol{tolerance}_pct"] = percent(hit.sum(), total)
@@ -98,7 +101,7 @@ def id_scores(labels: np.ndarray, matrix: np.ndarray, ids: set, tolerances: list
 
 
 def detection_scores(files: list[dict], mode: str) -> dict:
-    """GT0 행은 원 접촉 ID를 잃으므로 body/tip 검출 통계는 파일별로 합친다."""
+    """Pool body/tip detection per file because GT0 rows no longer identify the original contact ID."""
     if mode == "masked":
         return {"available": False}
     values = {name: sum(int(m["load_" + name]) for m in files) for name in ("tp", "fn", "tn", "fp")}
@@ -113,23 +116,23 @@ def identifier(row: dict) -> str:
 
 
 def input_name(folder: Path) -> str:
-    # 사용자가 폴더를 날짜만 남겨 정리한 경우도 같은 입력으로 연결한다.
+    # Match input configurations even when run directories have been renamed to retain only the date.
     return re.sub(r"^\d{8}_(?:\d{6}_)?", "", folder.name) or folder.name
 
 
 def _force_series_sources(folder: Path) -> list[dict]:
-    """현재 predictions와 연결된 organized를 읽고, 없으면 저장된 힘 시트를 사용합니다."""
+    """Read organized workbooks linked to current predictions, or fall back to saved force sheets."""
     source = folder / "predictions.xlsx"
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     manifest = json.loads((folder / "workbook_manifest.json").read_text())
     if manifest.get("sha256") != source_hash:
-        raise ValueError(f"predictions.xlsx와 workbook_manifest의 SHA256이 다릅니다: {folder}")
+        raise ValueError(f"SHA256 mismatch between predictions.xlsx and workbook_manifest: {folder}")
     models = pd.DataFrame(manifest["model_sheets"])
     models = models.loc[models.branch.eq("force") & models.rows.gt(0)].copy()
     if models.empty or models.duplicated(["mode", "model"]).any():
-        raise ValueError(f"대표 힘 모델이 없거나 중복됐습니다: {folder}")
+        raise ValueError(f"Representative force models are missing or duplicated: {folder}")
     if not models.force_unit.eq("mN").all():
-        raise ValueError(f"힘 Excel 단위는 mN이어야 합니다: {folder}")
+        raise ValueError(f"Force workbook units must be mN: {folder}")
     modes = models["mode"].unique().tolist()
     organized = None
     candidates = sorted(folder.glob("organized_*"), key=lambda p: re.sub(
@@ -146,7 +149,8 @@ def _force_series_sources(folder: Path) -> list[dict]:
                 if not {"_guide", "_models", "_rows", *AXES[:3]}.issubset(reader.sheets):
                     break
                 guide = dict(reader.read("_guide").itertuples(index=False, name=None))
-                matches = guide.get("입력 SHA256") == source_hash
+                # Accept English labels and the legacy Korean key in saved workbooks.
+                matches = guide.get("Input SHA256", guide.get("\uc785\ub825 SHA256")) == source_hash
             finally:
                 reader.close()
             if not matches:
@@ -171,7 +175,7 @@ def _force_series_sources(folder: Path) -> list[dict]:
                     saved = saved_models.loc[saved_models.model.eq(model.model)]
                     if (len(saved) != 1 or saved.iloc[0].checkpoint_sha256 != model.checkpoint_sha256
                             or saved.iloc[0].fixed_partner != model.fixed_partner):
-                        raise ValueError(f"organized 대표 힘 모델 정보가 다릅니다: {path} / {model.model}")
+                        raise ValueError(f"Representative force-model metadata differs in the organized workbook: {path} / {model.model}")
             else:
                 reference, frames = None, {}
                 for model in selected.itertuples():
@@ -183,28 +187,28 @@ def _force_series_sources(folder: Path) -> list[dict]:
         finally:
             reader.close()
         if hashlib.sha256(path.read_bytes()).hexdigest() != before:
-            raise ValueError(f"읽는 중 힘 Excel이 변경됐습니다: {path}")
+            raise ValueError(f"Force workbook changed while being read: {path}")
         expected = selected.model.tolist()
         for axis, table in axes.items():
             if len(table) != len(rows) or list(table) != [f"gt_{axis}_mN", *expected]:
-                raise ValueError(f"힘 시트와 원본 행/모델 목록이 다릅니다: {path} / {axis}")
+                raise ValueError(f"Force sheets do not match the source-row/model lists: {path} / {axis}")
             if not np.isfinite(table.to_numpy(dtype=float)).all():
-                raise ValueError(f"힘 GT/예측에 비수치 값이 있습니다: {path} / {axis}")
+                raise ValueError(f"Force GT/predictions contain nonnumeric values: {path} / {axis}")
         if (rows[KEYS].isna().any().any() or rows.duplicated(KEYS).any()
                 or not np.isfinite(rows.source_row.to_numpy(float)).all()
                 or not rows.source_row.eq(np.floor(rows.source_row)).all() or rows.source_row.lt(0).any()):
-            raise ValueError(f"원본 파일/행 키가 없거나 중복/비정수입니다: {path}")
+            raise ValueError(f"Source file/row keys are missing, duplicated or noninteger: {path}")
         result.append({"mode": mode, "models": selected, "rows": rows, "axes": axes,
                        "source_workbook": str(path), "source_sha256": before,
                        "predictions_sha256": source_hash,
                        "source_kind": "organized" if organized else "predictions"})
     if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
-        raise ValueError(f"읽는 중 predictions.xlsx가 변경됐습니다: {folder}")
+        raise ValueError(f"predictions.xlsx changed while being read: {folder}")
     return result
 
 
 def combined_force_tables(folders: list[Path], force_files=()) -> dict:
-    """입력·방식·대표 모델을 열로 모읍니다. 실제 원본 행 교집합에서만 GT를 공유합니다."""
+    """Collect input/mode/representative-model columns and share GT only on intersecting source rows."""
     entries, reference = [], None
     names = [input_name(folder) for folder in folders]
     for folder, name in zip(folders, names):
@@ -216,7 +220,7 @@ def combined_force_tables(folders: list[Path], force_files=()) -> dict:
                 keep = rows.source_file.map(lambda p: Path(p).name).isin(force_files)
                 rows = rows.loc[keep].reset_index(drop=True)
                 axes = {axis: frame.loc[keep].reset_index(drop=True) for axis, frame in axes.items()}
-            # Excel의 표시 행 번호가 아니라 원 CSV의 파일/행을 기준으로 맞춥니다.
+            # Align using the original CSV file/row keys rather than Excel display row numbers.
             truth = rows.drop(columns=["excel_row"]).copy()
             for axis, frame in axes.items():
                 truth[f"gt_{axis}_mN"] = frame[f"gt_{axis}_mN"].to_numpy()
@@ -230,14 +234,14 @@ def combined_force_tables(folders: list[Path], force_files=()) -> dict:
                     pd.testing.assert_frame_equal(truth.loc[common, reference.columns], reference,
                                                   check_dtype=False, check_exact=True)
                 except AssertionError as exc:
-                    raise ValueError(f"같은 원본 행의 GT/ID/부하 정보가 다릅니다: {folder} / {item['mode']}") from exc
+                    raise ValueError(f"GT/ID/load information differs for the same source rows: {folder} / {item['mode']}") from exc
             if reference.empty:
-                raise ValueError("모든 입력/방식에 공통인 힘 예측 행이 없습니다.")
+                raise ValueError("No force prediction rows are shared by every input/mode.")
             item.update(run=str(folder), input=name, prefix=prefix, rows=rows, axes=axes)
             entries.append(item)
-        print(f"힘 시계열 읽음: {folder.name}", flush=True)
+        print(f"Read force time series: {folder.name}", flush=True)
     if not entries:
-        raise ValueError("힘 시계열을 합칠 predict 폴더가 없습니다.")
+        raise ValueError("No prediction directories were provided for combining force time series.")
     common = reference.index
     values = {axis: {f"gt_{axis}_mN": reference[f"gt_{axis}_mN"].to_numpy(float)} for axis in AXES[:3]}
     columns, alignment, scores = [], [], []
@@ -250,7 +254,7 @@ def combined_force_tables(folders: list[Path], force_files=()) -> dict:
         for model in item["models"].to_dict("records"):
             column = f"{item['prefix']}_{item['mode']}_{model['model']}_mN"
             if column in values["fx"]:
-                raise ValueError(f"힘 예측 열 이름이 중복됩니다: {column}")
+                raise ValueError(f"Duplicate force prediction column name: {column}")
             errors = []
             score = {"column": column, "input": item["input"], "mode": item["mode"],
                      "model": model["model"], "n": len(common)}
@@ -271,12 +275,12 @@ def combined_force_tables(folders: list[Path], force_files=()) -> dict:
     result = {axis: pd.DataFrame(data) for axis, data in values.items()}
     result.update(force_rows=rows, force_columns=pd.DataFrame(columns),
                   force_alignment=pd.DataFrame(alignment), force_common_metrics=pd.DataFrame(scores))
-    print(f"통합 힘 시계열: {len(rows):,}행, 축당 GT 1열 + 예측 {len(columns)}열", flush=True)
+    print(f"Combined force time series: {len(rows):,} rows, 1 GT column + {len(columns)} prediction columns per axis", flush=True)
     return result
 
 
 def choose_models(comparison: pd.DataFrame, summary: dict, reports: dict) -> tuple[set, set]:
-    # Force는 predict가 저장한 validation 선택을 그대로 사용한다.
+    # Force evaluation retains the validation selection saved by predict.
     force = {identifier(row) for row in summary["best_by_mode"].values()}
     available = comparison[comparison.apply(lambda row: identifier(row) in reports, axis=1)].copy()
     for column in ("location_macro_recall", "location_validation_ce", "force_rmse_xyz_mN"):
@@ -287,7 +291,7 @@ def choose_models(comparison: pd.DataFrame, summary: dict, reports: dict) -> tup
         ascending=[False, True, True, True, True], na_position="last")
     location = {identifier(row) for row in ordered.groupby("mode", sort=False).head(1).to_dict("records")}
     if not force or not force.issubset(reports) or not location:
-        raise ValueError("저장된 validation 모델 선택을 확인할 수 없습니다.")
+        raise ValueError("The saved validation model selection could not be verified.")
     return force, location
 
 
@@ -295,7 +299,7 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
     sources = []
     metrics = read_json(folder / "metrics.json", sources)
     if "all_combinations" not in metrics:
-        raise ValueError("--train-dir로 predict한 전조합 결과 폴더를 지정하세요. 단일 checkpoint 결과는 지원하지 않습니다.")
+        raise ValueError("Provide an all-combination prediction directory created with --train-dir; single-checkpoint results are not supported.")
     manifest = read_json(folder / "workbook_manifest.json", sources)
     inputs = read_json(folder / "input_manifest.json", sources)
     summary = read_json(folder / "summary.json", sources)
@@ -307,7 +311,7 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
     sheets = manifest["model_sheets"]
     scopes = {item["force_scope"] for item in sheets}
     if len(scopes) != 1:
-        raise ValueError("한 실행의 force_scope가 일관되지 않습니다.")
+        raise ValueError("force_scope is inconsistent within one run.")
     force_scope = scopes.pop()
     name = input_name(folder)
     run = str(folder)
@@ -316,7 +320,7 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
     if force_files:
         missing = set(force_files) - {Path(path).name for path in trial_map}
         if missing:
-            raise ValueError(f"{folder.name}: 요청한 force 파일이 없습니다: {sorted(missing)}")
+            raise ValueError(f"{folder.name}: Requested force files were not found: {sorted(missing)}")
     representative = {"force": set(), "location": set()}
     for item in sheets:
         force_model = item["model"] if item["branch"] == "force" else item["fixed_partner"]
@@ -355,7 +359,7 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
             tables["detection"].append(detection)
             if key in id_best:
                 tables["id_selected"].append({**score, **{"detection_" + k: v for k, v in detection.items() if k not in model and k != "group"}})
-        # ID/파일별 상세 표는 validation 선택 모델과 organized와 같은 대표분기다.
+        # Per-ID/file detail tables use validation-selected models and the same representative branches as organized workbooks.
         if key in force_best | representative["force"]:
             for path, segment, values in selected_files:
                 for state in STATES:
@@ -376,51 +380,51 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
                         "count": int(matrix[i, j]), "row_support": int(matrix[i].sum()),
                         "row_pct": percent(matrix[i, j], matrix[i].sum())})
     tables["sources"].extend({"run": run, **source} for source in sources)
-    print(f"분석: {folder.name} / force_scope={force_scope} / {len(reports)}조합", flush=True)
+    print(f"Analyzed: {folder.name} / force_scope={force_scope} / {len(reports)} combinations", flush=True)
 
 
 def guide(force_files: list[str], tolerances: list[int]) -> pd.DataFrame:
     return pd.DataFrame([
-        ("먼저 볼 시트", "force_body_summary / id_body_summary: body 요약. force_file_detail: 선택한 별도 힘 파일. --previous 사용 시 force_file_comparison: 이전/현재 비교."),
-        ("MATLAB", "plot_analysis.m에서 이 Excel 하나만 선택. 여러 predict 폴더는 이미 이 파일 안에 합쳐져 있으므로 별도 Excel 병합이 필요 없음."),
-        ("단위", "힘 mN, 정확도 %, n은 평가행 수. 빈 셀은 평가 불가이며 0 오차/0%가 아님."),
-        ("힘 범위", "저장된 force_scope 사용. tip 학습의 body는 N=0. all_single_contact는 각 접촉점의 실측 힘을 평가."),
-        ("힘 평가 파일", ", ".join(force_files) or "저장된 전체 test 파일. 특정 독립 실험만 보려면 --force-file 사용."),
-        ("부하 구분", "저장 라벨 사용. 현재 YAML을 읽거나 문턱을 다시 적용하지 않음. 힘은 all/loaded/unloaded로 분리."),
-        ("힘 pooling", "RMSE=sqrt(sum(N_file*RMSE_file^2)/sum N_file); MAE=sum(N_file*MAE_file)/sum N_file."),
-        ("XYZ 오차", "3축 성분 전체의 RMSE/MAE. 힘 벡터 norm 오차나 각 축 RMSE의 산술평균이 아님."),
-        ("ID 평가", "GT 유부하만 분모. Masked=ID1–18 argmax, Class0=최종 ID0–18 argmax. 예측0은 모든 tolerance에서 실패."),
-        ("ID tolerance", f"{tolerances}: 예측ID>0 AND abs(예측ID-GT)<=n. 확률 합이 아닌 정답률. ±n 성공은 tip/body 구분 성공과 다름."),
-        ("Macro", "지원행이 있는 GT ID별 성공률의 동일 가중 평균. micro accuracy는 전체 행 기준."),
-        ("검출", "Class0의 TP/FN/TN/FP 및 유부하 검출률, 무부하 정답률. Masked 자체 검출은 평가 불가."),
-        ("힘 모델 선택", "predict summary.json의 validation 힘 우선 선택 쌍 그대로. Test 최소 오차로 재선택하지 않음."),
-        ("ID 모델 선택", "validation location_macro_recall 최대, CE/힘 RMSE/모델명 순 동률 처리. Class0 validation 점수는 ID0 제외 후보이며 test 보고는 최종 출력."),
-        ("선택 모델", "force_selected와 id_selected는 서로 다른 bundle일 수 있음. 두 성능을 한 bundle의 결과로 합치지 말 것."),
-        ("전체 조합", "models, force, location, detection 시트는 모든 저장 조합. force는 전체/body/tip × all/loaded/unloaded."),
-        ("상세 및 대표모델", "force_by_file/force_by_id/id_by_id는 validation 선택 + organized와 동일한 고정 파트너 대표분기. representative_* 열로 선택."),
-        ("혼동행렬", "ID validation 선택 모델. GT0 행은 Class0 무부하 전체; body/tip 무부하별 통계는 detection 시트."),
-        ("ID 파일 범위", "ID는 모든 저장 test를 평가. --force-file은 힘 분석에만 적용; 저장 혼동행렬만으로 임의 파일별 ±n는 계산 불가."),
-        ("비교 해석", "기존 집계/그림의 입력별 N과 학습 자료가 다를 수 있음. fx/fy/fz는 원본 끝행 교집합으로 비교하지만 입력창 전체 이력이나 학습 자료까지 맞추지는 않음."),
-        ("행별 힘 비교", "fx/fy/fz: 공통 GT 1열 + 입력조합_방식_힘모델_mN 예측 열. Masked/Class0 모두 포함. force_rows로 원CSV/행/ID를 찾고 force_columns에서 실제 checkpoint와 위치 파트너 확인."),
-        ("시계열의 출처", "현재 predictions.xlsx hash에 연결된 최신 organized 힘 Excel을 읽음. organized가 없거나 오래됐으면 저장 predictions.xlsx의 대표 힘 시트 사용. 학습/추론/보간/재라벨 없음."),
-        ("공통행 힘 지표", "force_common_metrics는 fx/fy/fz의 동일 공통행에서 재계산한 대표 힘 모델 RMSE/MAE. force_alignment에 입력/방식별 사용 원Excel/hash/행 수 기록. 기존 전체 조합 집계 및 그림의 분모는 바꾸지 않음."),
-        ("대표 힘 모델 범위", "행별 비교는 입력별 2방식×11힘모델 등 predictions.xlsx에 저장된 대표 분기. 모든 힘×위치 조합의 행별 예측을 의미하지 않으며 validation 최선모델과 다를 수 있음."),
-        ("이전 비교", "--previous는 동일 입력명/방식/파일을 연결. predictions.csv의 평가 원행·GT·부하별 집합과 파일 hash가 같을 때만 오차 차이를 표시. 시간창 이력/학습자료/선택모델까지 통제한 인과 비교는 아님."),
-        ("추가 진단", "힘 크기별 ID 정확도와 시계열 그래프는 별도 분석. fx/fy/fz의 공통행 힘 예측은 이 Excel에서 바로 그래프로 그릴 수 있음."),
-    ], columns=["항목", "설명"])
+        ("Start here", "force_body_summary / id_body_summary summarize body results. force_file_detail covers the selected separate force file. With --previous, force_file_comparison compares previous/current runs."),
+        ("MATLAB", "Select this workbook in plot_analysis.m. Multiple prediction directories are already combined here, so no separate workbook merge is needed."),
+        ("Units", "Force is in mN, accuracy in %, and n counts evaluated rows. Blank cells are not evaluable, rather than zero error or 0% accuracy."),
+        ("Force scope", "Uses the saved force_scope. Body support is N=0 for tip-trained models. all_single_contact evaluates measured force at each contact location."),
+        ("Force evaluation files", ", ".join(force_files) or "All saved test files. Use --force-file to select a particular independent experiment."),
+        ("Load states", "Uses saved labels without reloading the current YAML or reapplying thresholds. Force metrics are separated into all/loaded/unloaded."),
+        ("Force pooling", "RMSE=sqrt(sum(N_file*RMSE_file^2)/sum N_file); MAE=sum(N_file*MAE_file)/sum N_file."),
+        ("XYZ error", "RMSE/MAE pooled across all three axis components, not force-vector norm error or the arithmetic mean of per-axis RMSE."),
+        ("ID evaluation", "The denominator includes GT-loaded rows only. Masked uses ID1–18 argmax; Class0 uses final ID0–18 argmax. A prediction of 0 fails at every tolerance."),
+        ("ID tolerance", f"{tolerances}: predicted ID>0 AND abs(predicted ID-GT)<=n. This is accuracy, not summed probability. Success within ±n does not imply correct tip/body discrimination."),
+        ("Macro", "Equally weighted mean accuracy across GT IDs with support. Micro accuracy pools all rows."),
+        ("Detection", "Class0 TP/FN/TN/FP, loaded detection rate and unloaded accuracy. Masked has no independent detection output to evaluate."),
+        ("Force model selection", "Retains the validation force-priority pair from predict summary.json; does not reselect by minimum test error."),
+        ("ID model selection", "Maximizes validation location_macro_recall, breaking ties by CE, force RMSE and model name. Class0 validation scores use candidates excluding ID0; test reporting uses final outputs."),
+        ("Selected models", "force_selected and id_selected may refer to different bundles. Their scores must not be combined as results from a single bundle."),
+        ("All combinations", "models, force, location and detection sheets include every saved combination. Force covers overall/body/tip × all/loaded/unloaded."),
+        ("Detail and representative models", "force_by_file/force_by_id/id_by_id include validation selections and the same fixed-partner representative branches as organized workbooks. Use representative_* columns to select them."),
+        ("Confusion matrix", "Uses the validation-selected ID model. The GT0 row contains all Class0 unloaded rows; detection sheets separate body/tip unloaded statistics."),
+        ("ID file scope", "ID evaluation uses all saved test files. --force-file applies only to force analysis; saved confusion matrices cannot recover arbitrary per-file ±n scores."),
+        ("Comparison interpretation", "Input configurations may differ in sample counts and training data in existing aggregates/plots. fx/fy/fz align intersecting source endpoints, without matching complete input-window histories or training data."),
+        ("Row-wise force comparison", "fx/fy/fz contain one shared GT column plus input_mode_force-model_mN prediction columns for both Masked and Class0. force_rows identifies the source CSV/row/ID; force_columns records the checkpoint and location partner."),
+        ("Time-series provenance", "Reads the latest organized force workbook linked to the current predictions.xlsx hash. If unavailable or stale, uses representative force sheets in predictions.xlsx. No training, inference, interpolation or relabeling is performed."),
+        ("Common-row force metrics", "force_common_metrics recalculates representative-model RMSE/MAE on identical fx/fy/fz rows. force_alignment records source workbooks, hashes and row counts per input/mode. Denominators in existing all-combination aggregates and plots remain unchanged."),
+        ("Representative force scope", "Row-wise comparisons use representative branches saved in predictions.xlsx, such as 2 modes × 11 force models per input. They do not contain row-wise predictions for every force/location pair and may differ from validation-selected models."),
+        ("Previous comparisons", "--previous matches input names, modes and files. Error differences are shown only when evaluated source-row/GT/load-state sets in predictions.csv and file hashes match. This is not a causal comparison controlling window histories, training data or selected models."),
+        ("Additional diagnostics", "ID accuracy by force magnitude and time-series diagnostics are separate analyses. Common-row fx/fy/fz predictions can be plotted directly from this workbook."),
+    ], columns=["Item", "Description"])
 
 
 def force_file_results(folder: Path, filename: str, experiment: str, sources: list) -> list[dict]:
-    """별도 힘 시험의 validation 선택 모델. 이전/현재 비교용 행·GT 지문도 보존한다."""
+    """Evaluate validation-selected models on a separate force trial and retain row/GT fingerprints for comparisons."""
     reports = read_json(folder / "metrics.json", sources)["all_combinations"]
     summary = read_json(folder / "summary.json", sources)
     inputs = read_json(folder / "input_manifest.json", sources)
     files = [item for item in inputs if Path(item["path"]).name == filename]
     if not files:
-        print(f"별도 힘 파일 생략: {folder.name} / {filename} 없음", flush=True)
+        print(f"Skipping separate force file: {folder.name} / {filename} not found", flush=True)
         return []
     if len(files) != 1:
-        raise ValueError(f"동일 이름의 시험 파일이 여러 개입니다: {folder} / {filename}")
+        raise ValueError(f"Multiple test files have the same name: {folder} / {filename}")
     trial = files[0]
     csv = folder / "predictions.csv"
     rows = None
@@ -439,14 +443,14 @@ def force_file_results(folder: Path, filename: str, experiment: str, sources: li
             if rows is not None:
                 part = rows[rows["mode"].eq(mode)]
                 if not (part.force_model.eq(chosen["force_model"]) & part.location_model.eq(chosen["location_model"])).all():
-                    raise ValueError(f"predictions.csv와 summary의 선택 모델이 다릅니다: {folder}")
+                    raise ValueError(f"Selected models differ between predictions.csv and summary: {folder}")
                 numeric = [f"{kind}_{axis}_N" for kind in ("true", "pred") for axis in AXES[:3]]
                 part = part[np.isfinite(part[numeric].to_numpy(dtype=float)).all(axis=1)]
                 if state != "all":
                     part = part[part.load_state_gt.eq(state)]
                 part = part.sort_values("source_row")
                 if len(part) != score["n"] or part.source_row.duplicated().any():
-                    raise ValueError(f"힘 평가행 수/중복이 저장 지표와 맞지 않습니다: {folder} / {mode} / {state}")
+                    raise ValueError(f"Force evaluation row counts or duplicates do not match the saved metrics: {folder} / {mode} / {state}")
                 data = part[["source_row", "true_fx_N", "true_fy_N", "true_fz_N"]].to_numpy(dtype="<f8")
                 fingerprint = hashlib.sha256(data.tobytes()).hexdigest() if len(part) else ""
             result.append({"input": input_name(folder), "run": str(folder), "experiment": experiment,
@@ -457,7 +461,7 @@ def force_file_results(folder: Path, filename: str, experiment: str, sources: li
 
 
 def add_summaries(frames: dict, folders: list[Path], previous: list[Path], filename: str) -> dict:
-    """기존 상세표를 유지하고 읽기 쉬운 요약/동일 파일 전후 비교를 앞에 둔다."""
+    """Prepend readable summaries and previous/current comparisons while retaining existing detail tables."""
     extra = {"force_body_summary": frames["force_selected"].query("group == 'body'").copy(),
              "id_body_summary": frames["id_selected"].query("group == 'body'").copy()}
     sources, rows = [], []
@@ -472,10 +476,10 @@ def add_summaries(frames: dict, folders: list[Path], previous: list[Path], filen
             current = detail[detail.experiment.eq("current")]
             old = detail[detail.experiment.eq("previous")]
             if current.duplicated(keys).any() or old.duplicated(keys).any():
-                raise ValueError("이전 비교는 입력당 한 실행씩 지정하세요. 동일 입력 이름의 실행이 여러 개입니다.")
+                raise ValueError("Specify one previous run per input configuration; multiple runs share the same input name.")
             joined = current.merge(old, on=keys, suffixes=("_new", "_old"), how="inner", validate="one_to_one")
             if joined.empty:
-                raise ValueError("이전/현재에 동일 입력명·방식·별도 힘 파일이 없습니다.")
+                raise ValueError("No matching input name, mode and separate force file exist across previous/current runs.")
             joined["same_evaluation_rows_gt"] = (joined.source_sha256_new.eq(joined.source_sha256_old) &
                 joined.evaluation_rows_gt_sha256_new.ne("") &
                 joined.evaluation_rows_gt_sha256_new.eq(joined.evaluation_rows_gt_sha256_old) &
@@ -490,7 +494,7 @@ def add_summaries(frames: dict, folders: list[Path], previous: list[Path], filen
 
 
 def write_excel(tables: dict, destination: Path) -> None:
-    # 행별 힘 예측 수백만 셀을 메모리에 쌓지 않고 한 행씩 저장합니다.
+    # Stream rows instead of accumulating millions of force-prediction cells in memory.
     options = {"constant_memory": True, "strings_to_formulas": False, "strings_to_urls": False}
     with xlsxwriter.Workbook(destination, options) as book:
         book.use_zip64()
@@ -498,8 +502,8 @@ def write_excel(tables: dict, destination: Path) -> None:
         number = book.add_format({"num_format": "0.000000"})
         for name, frame in tables.items():
             if len(frame) >= 1048576 or len(frame.columns) > 16384:
-                raise ValueError(f"{name}: Excel 시트 크기를 초과했습니다.")
-            # 점수는 왼쪽에, 긴 원본 경로와 선택 여부 등 출처 정보는 오른쪽에 둔다.
+                raise ValueError(f"{name}: Excel worksheet size limit exceeded.")
+            # Place scores on the left and provenance, long source paths and selection flags on the right.
             preferred = ["input", "mode", "force_model", "location_model", "group", "load_state", "contact_id", "gt_id", "n", "n_loaded"]
             preferred += [f"{metric}_{axis}_mN" for metric in ("rmse", "mae") for axis in AXES]
             preferred += [column for column in frame.columns if column.startswith(("accuracy_tol", "macro_tol"))]
@@ -664,11 +668,11 @@ def expand_folders(patterns: list[str]) -> list[Path]:
     for pattern in patterns:
         matches = sorted(glob.glob(str(Path(pattern).expanduser())))
         if not matches:
-            raise ValueError(f"결과 폴더를 찾을 수 없습니다: {pattern}")
+            raise ValueError(f"Result directory not found: {pattern}")
         for path in matches:
             folder = Path(path).resolve()
             if not (folder / "metrics.json").is_file():
-                raise ValueError(f"metrics.json이 있는 predict 실행 폴더를 지정하세요: {folder}")
+                raise ValueError(f"Provide a prediction run directory containing metrics.json: {folder}")
             if folder not in folders:
                 folders.append(folder)
     return folders
@@ -676,16 +680,16 @@ def expand_folders(patterns: list[str]) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("predict_dirs", nargs="+", help="predict 결과 폴더 하나/여러 개 또는 따옴표로 감싼 glob")
-    parser.add_argument("--output", type=Path, help="새 분석 폴더; 기본 results/analysis/날짜시간_comparison")
-    parser.add_argument("--force-file", nargs="+", default=[], help="힘 평가에 포함할 CSV 파일명. 생략하면 전체 test; ID 평가는 전체 유지")
-    parser.add_argument("--id-tolerances", nargs="+", type=int, default=[2, 3], help="기본 2 3; 정확 ID(0)와 ±1도 항상 계산")
-    parser.add_argument("--previous", nargs="+", default=[], help="선택: 이전 predict 폴더/glob. 동일 입력의 별도 힘 파일 전후 비교")
+    parser.add_argument("predict_dirs", nargs="+", help="one or more prediction result directories or quoted glob patterns")
+    parser.add_argument("--output", type=Path, help="new analysis directory (default: results/analysis/date_time_comparison)")
+    parser.add_argument("--force-file", nargs="+", default=[], help="CSV filenames for force evaluation; defaults to all test files; ID evaluation always uses all files")
+    parser.add_argument("--id-tolerances", nargs="+", type=int, default=[2, 3], help="default: 2 3; exact ID (0) and ±1 are always computed")
+    parser.add_argument("--previous", nargs="+", default=[], help="optional previous prediction directories/globs for comparing separate force trials with matching inputs")
     parser.add_argument("--comparison-force-file", default="summary_18_test_2.csv",
-                        help="별도 힘 시험 시트/그림에 사용할 파일명. 기본 summary_18_test_2.csv; --force-file 집계 필터와 별개")
+                        help="filename for separate force-trial sheets/plots (default: summary_18_test_2.csv); independent of the --force-file aggregation filter")
     args = parser.parse_args()
     if any(n < 0 or n > 17 for n in args.id_tolerances):
-        parser.error("ID tolerance는 0–17이어야 합니다.")
+        parser.error("ID tolerance must be between 0 and 17.")
     tolerances = sorted({0, 1, *args.id_tolerances})
     try:
         folders = expand_folders(args.predict_dirs)
@@ -695,7 +699,7 @@ def main() -> None:
     stamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d_%H%M%S_%f")
     output = (args.output or Path("results/analysis") / (stamp + "_comparison")).resolve()
     if output.exists():
-        parser.error(f"기존 결과를 보존합니다. 새 --output 경로를 지정하세요: {output}")
+        parser.error(f"Existing results are preserved; specify a new --output path: {output}")
     tables, matrices = defaultdict(list), []
     for folder in folders:
         analyze_run(folder, args.force_file, tolerances, tables, matrices)
@@ -711,10 +715,10 @@ def main() -> None:
     plot_summary(frames, output, tolerances)
     plot_confusions(matrices, output)
     plot_force_details(frames, output)
-    print(f"분석 완료: {output}")
-    print("fx/fy/fz: 공통 GT + 입력조합_방식_모델별 힘 예측. force_common_metrics: 같은 행의 RMSE/MAE")
-    print("Excel 하나: force_body_summary / id_body_summary → body, force_file_comparison → 이전 비교")
-    print("MATLAB: plot_analysis.m 실행 후 이 Excel 선택. 별도 Excel 병합 불필요.")
+    print(f"Analysis complete: {output}")
+    print("fx/fy/fz: shared GT + force predictions by input/mode/model. force_common_metrics: RMSE/MAE on identical rows")
+    print("One workbook: force_body_summary / id_body_summary for body results; force_file_comparison for previous/current comparisons")
+    print("MATLAB: run plot_analysis.m and select this workbook; no separate workbook merge is needed.")
 
 
 if __name__ == "__main__":

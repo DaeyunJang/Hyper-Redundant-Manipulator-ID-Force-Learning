@@ -1,13 +1,14 @@
-"""힘/접촉 위치의 독립 네트워크 11종: 구조를 바꿀 때 이 파일을 수정한다.
+"""Eleven network families for independent force and contact-location estimation.
 
-입력 (batch, time, feature), 마지막 시점의 힘3개 또는 위치logits를 반환한다.
-MLP만 마지막 행을 사용하며 나머지는 과거 입력을 읽는다. 모든 시간 연산은
-인과적이다. 단위·정규화·무부하 라벨은 모델 밖에서 처리한다.
+Inputs have shape (batch, time, feature). Outputs are three force components or
+contact-location logits for the final time step. MLP uses only the final row;
+other models consume input histories. All temporal operations are causal.
+Units, normalization and no-load labels are handled outside the models.
 
-수정 순서: DEFAULT_PARAMS(기본 크기) → 해당 Encoder(구조) → _build_encoder(등록).
-실행별 크기는 configs/train.yaml의 force_params/location_params로 덮어쓸 수 있다.
-window_samples는 데이터 설정이며 기본30행은 최적 길이로 검증된 값이 아니다.
-KalmanNet은 GRU+MLP 별칭이며 물리 Kalman filter가 아니다.
+To modify a model, update DEFAULT_PARAMS, its encoder and _build_encoder.
+Per-run sizes can be overridden with force_params/location_params in configs/train.yaml.
+window_samples is a data setting; the default 30 rows is not an optimized length.
+KalmanNet is a legacy name for a GRU+MLP model, not a physical Kalman filter.
 """
 from __future__ import annotations
 
@@ -20,23 +21,23 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-# ── 1. 모델 목록과 크기 설정 ─────────────────────────────────────────────
+# 1. Model families and default sizes.
 MODEL_NAMES = (
     "mlp", "cnn", "convmixer", "resnet", "lstm", "gru", "tcn",
     "transformer", "kalmannet", "small_gru", "residual_tcn",
 )
 MODEL_DESCRIPTIONS = {
-    "mlp": "MLP208/104/52 (마지막 시점만)",
+    "mlp": "MLP208/104/52 (final time step only)",
     "cnn": "Causal CNN64, kernel3 × 2",
     "convmixer": "Causal ConvMixer64, depthwise kernel5",
     "resnet": "Causal ResNet64, residual blocks × 2",
     "lstm": "LSTM60 → LSTM30 → Dense32",
     "gru": "GRU72 → GRU36",
-    "tcn": "Causal TCN64, dilation1/2/4 (수용영역15)",
+    "tcn": "Causal TCN64, dilation1/2/4 (receptive field 15)",
     "transformer": "Transformer32, heads2, FF64, causal + sinusoidal position",
-    "kalmannet": "GRU96 + MLP96 (legacy KalmanNetLite; Kalman filter 아님)",
+    "kalmannet": "GRU96 + MLP96 (legacy KalmanNetLite; not a Kalman filter)",
     "small_gru": "GRU64, 1 layer",
-    "residual_tcn": "Residual causal TCN32, dilation1/2/4 (수용영역29)",
+    "residual_tcn": "Residual causal TCN32, dilation1/2/4 (receptive field 29)",
 }
 
 
@@ -99,9 +100,11 @@ def resolve_params(name: str, params: Mapping | None = None) -> dict:
     return resolved
 
 
-# ── 2. 공통 convolution 블록 ────────────────────────────────────────────
+# 2. Shared convolution blocks.
+# AUTHOR: Daeyun
+# Project implementations and adaptations of the network families listed above.
 class CausalConv1d(nn.Conv1d):
-    """입력 B,C,T에서 과거 값만 읽고 시간 길이를 보존한다."""
+    """Use only current/past values in B,C,T inputs while preserving sequence length."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
                  dilation: int = 1, groups: int = 1):
@@ -114,7 +117,7 @@ class CausalConv1d(nn.Conv1d):
 
 
 class ChannelLayerNorm(nn.Module):
-    """시간 위치마다 독립적으로 channel만 정규화한다 (입력 B,C,T)."""
+    """Normalize channels independently at each time step for B,C,T inputs."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -153,9 +156,9 @@ class ConvMixerBlock(nn.Module):
         return self.pointwise(x + self.depthwise(x))
 
 
-# ── 3. 모델별 Encoder ──────────────────────────────────────────────────
+# 3. Encoders for each model family.
 class ConvolutionEncoder(nn.Module):
-    """CNN/ConvMixer/ResNet/TCN의 시간축 구조. 출력은 (B,T,channels)."""
+    """Temporal CNN/ConvMixer/ResNet/TCN encoder with output shape (B,T,channels)."""
 
     def __init__(self, input_dim: int, name: str, params: dict):
         super().__init__()
@@ -190,13 +193,13 @@ class ConvolutionEncoder(nn.Module):
 
 
 class RecurrentEncoder(nn.Module):
-    """LSTM/GRU의 폭·층수는 hidden_sizes, 마지막 투영 크기는 projection_dim."""
+    """hidden_sizes sets LSTM/GRU widths and depth; projection_dim sets the final projection."""
 
     def __init__(self, input_dim: int, name: str, params: dict):
         super().__init__()
         recurrent = nn.LSTM if name == "lstm" else nn.GRU
         widths = params["hidden_sizes"]
-        # 기존 checkpoint의 first/second 키를 유지한다. 사용자 크기는 layers 키다.
+        # Preserve first/second keys in existing checkpoints; custom sizes use layers.
         self.default_layout = params == DEFAULT_PARAMS[name]
         if self.default_layout:
             self.first = recurrent(input_dim, widths[0], batch_first=True)
@@ -214,7 +217,7 @@ class RecurrentEncoder(nn.Module):
         self.output_dim = widths[-1] if projection_dim is None else projection_dim
 
     def forward(self, x: Tensor) -> Tensor:
-        # 매 창마다 hidden state를 초기화하며 서로 다른 창의 state를 전달하지 않는다.
+        # Reset hidden state for each window; never carry state between windows.
         layers = ([self.first, self.second] if self.default_layout else self.layers)
         for layer in layers:
             if layer is not None:
@@ -223,7 +226,7 @@ class RecurrentEncoder(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    """위치 인코딩과 causal mask가 있는 Transformer; 미래 행을 보지 않는다."""
+    """Transformer with positional encoding and a causal mask; future rows are hidden."""
 
     def __init__(self, input_dim: int, seq_len: int, params: dict):
         super().__init__()
@@ -235,7 +238,7 @@ class TransformerEncoder(nn.Module):
             dim_feedforward=params["dim_feedforward"], dropout=params["dropout"],
             activation="gelu", batch_first=True,
         ) for _ in range(params["num_layers"])]
-        # 기존 기본 checkpoint는 layer, 사용자 크기는 layers라는 키를 사용한다.
+        # Existing default checkpoints use layer; custom sizes use layers.
         self.default_layout = params == DEFAULT_PARAMS["transformer"]
         if self.default_layout:
             self.layer = layers[0]
@@ -260,7 +263,7 @@ class TransformerEncoder(nn.Module):
         return x
 
 
-# ── 4. 분기 생성과 독립 통합 모델 ────────────────────────────────────────
+# 4. Branch construction and the independent two-network container.
 def _build_encoder(name: str, input_dim: int, seq_len: int, params: dict):
     if name == "mlp":
         layers = []
@@ -279,7 +282,7 @@ def _build_encoder(name: str, input_dim: int, seq_len: int, params: dict):
 
 
 class IndependentBranch(nn.Module):
-    """한 개의 힘 또는 위치 네트워크. softmax/힘 clipping은 적용하지 않는다."""
+    """One force or location network; no softmax or force clipping is applied."""
 
     def __init__(self, name: str, input_dim: int, seq_len: int, output_dim: int,
                  params: Mapping | None = None):
@@ -311,7 +314,7 @@ def _storage_keys(module: nn.Module):
 
 
 class HRMEstimator(nn.Module):
-    """파라미터를 공유하지 않는 힘/위치 네트워크의 저장·추론용 컨테이너."""
+    """Storage/inference container for force and location networks with no shared parameters."""
 
     def __init__(self, force_net: nn.Module, location_net: nn.Module):
         super().__init__()
@@ -354,7 +357,7 @@ def build_estimator(force_name: str, location_name: str, input_dim: int,
 
 
 def count_parameters(model: nn.Module) -> int:
-    """학습 가능한 파라미터 수; 위치 인코딩 같은 buffer는 제외한다."""
+    """Count trainable parameters, excluding buffers such as positional encodings."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
