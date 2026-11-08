@@ -1,6 +1,7 @@
 """predictions.xlsx를 GT + 모델별 열의 비교 Excel로 정리합니다. 학습/추론은 하지 않습니다.
 
 실행: python organize_results.py results/predict/날짜_시간/predictions.xlsx --id-tolerance 2
+여러 Excel/와일드카드를 주면 입력 조합 모두에 있는 공통 원본 행만 같은 순서로 정리합니다.
 수정: force_tables는 힘 시트, id_tables는 ID 시트, write_workbook은 표시 형식입니다.
 입력 Excel만 필요하며 모델·CSV·현재 train.yaml을 다시 읽지 않습니다.
 """
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import glob
 import hashlib
 from pathlib import Path
 import re
@@ -296,11 +298,16 @@ def write_workbook(path, tables):
         book.close()
 
 
-def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance=2):
+def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance=2,
+                      *, common_references=None, alignment=None):
     id_tolerance = validate_id_tolerance(id_tolerance)
     source = Path(source).expanduser().resolve()
     groups = parse_regions(regions)
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    if alignment is not None:
+        expected = alignment.loc[alignment.source_workbook == str(source), "source_sha256"]
+        if expected.empty or not expected.eq(source_hash).all():
+            raise ValueError(f"공통 행 확인 후 원본 Excel이 변경됐습니다: {source}")
     reader = WorkbookReader(source)
     branches = {"force": {}, "id": {}}
     references, skipped = {}, []
@@ -318,12 +325,19 @@ def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance
             if branch not in references:
                 references[branch] = frame
             frame = align_rows(frame, references[branch])
+            if common_references is not None:
+                target = common_references[branch]
+                keys = pd.MultiIndex.from_frame(target[KEYS])
+                # 원본 시트끼리의 정합성을 먼저 검사한 뒤 공통 끝행만 선택합니다.
+                frame = align_rows(frame.set_index(KEYS).loc[keys].reset_index(), target)
             branches[branch].setdefault(mode, {})[model] = frame
             print(f"읽음: {sheet} ({len(frame):,}행)", flush=True)
     finally:
         reader.close()
     if not references:
         raise ValueError("GT가 있는 force_*/id_* 결과가 없습니다. 프로젝트 predictions.xlsx를 지정하세요.")
+    if common_references is not None:
+        references = common_references
     results = {}
     for mode, frames in branches["force"].items():
         label = "loss-mask" if mode == "masked" else mode
@@ -349,6 +363,12 @@ def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance
         ("모델", "모델 개수·순서는 입력 시트를 따릅니다. 원본의 대표 파트너/checkpoint는 _models에 보존하며 새로 모델을 선택하지 않습니다."),
         ("빈 원본 시트", ", ".join(skipped) or "없음"),
     ], columns=["항목", "설명"])
+    if alignment is not None:
+        guide = pd.concat([guide, pd.DataFrame([
+            ("공통 행 비교", "_alignment의 모든 입력 Excel에 존재하는 source_file/source_row의 교집합입니다. 힘/ID별로 첫 입력의 행 순서를 따르며 공통 GT도 대조합니다. 행 수만 잘라 맞추거나 보간하지 않습니다."),
+            ("공통 행 지표", "_summary의 RMSE/MAE와 ID 지표는 이 파일에 남긴 공통 행으로 다시 계산했습니다. 원래 metrics.json 및 analysis.py의 집계 결과는 바꾸지 않습니다."),
+            ("비교 범위", "저장 Excel의 대표 모델 분기만 비교합니다. 같은 예측 끝행이어도 결측 연결 후 과거 29행 이력은 입력별로 다를 수 있습니다. 공통 행 필터는 재학습이나 동일 이력으로 재예측하는 처리가 아닙니다."),
+        ], columns=["항목", "설명"])], ignore_index=True)
     if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
         raise ValueError("정리 중 원본 Excel이 변경됐습니다.")
     destination = Path(output).expanduser().resolve() if output else source.parent / (
@@ -356,6 +376,8 @@ def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance
     destination.mkdir(parents=True, exist_ok=False)
     for name, tables in results.items():
         tables["_guide"] = guide
+        if alignment is not None:
+            tables["_alignment"] = alignment
         if not models.empty:
             tables["_models"] = models
         write_workbook(destination / name, tables)
@@ -363,19 +385,91 @@ def organize_workbook(source, output=None, regions=DEFAULT_REGIONS, id_tolerance
     return destination
 
 
+def organize_workbooks(sources, output=None, regions=DEFAULT_REGIONS, id_tolerance=2):
+    """여러 입력의 공통 예측 끝행을 찾고, 기존 정리/지표 함수를 그대로 사용합니다."""
+    id_tolerance = validate_id_tolerance(id_tolerance)
+    parse_regions(regions)
+    sources = list(dict.fromkeys(Path(p).expanduser().resolve() for p in sources))
+    if not sources:
+        raise ValueError("입력 Excel이 없습니다.")
+    if len(sources) == 1:
+        return [organize_workbook(sources[0], output, regions, id_tolerance)]
+    references, records = {}, []
+    # 전체 44개 시트를 여섯 입력 모두 동시에 메모리에 올리지 않습니다.
+    for source in sources:
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        reader = WorkbookReader(source)
+        found = {}
+        try:
+            for sheet in reader.sheets:
+                match = re.fullmatch(r"(force|id)_(masked|class0)_(.+)", sheet)
+                if match is None or match[1] in found:
+                    continue
+                frame = reader.read(sheet)
+                if frame.empty:
+                    continue
+                branch = match[1]
+                found[branch] = align_rows(frame, frame)
+        finally:
+            reader.close()
+        if not found or (references and set(found) != set(references)):
+            raise ValueError(f"비교 Excel의 force/id 분기 구성이 다릅니다: {source}")
+        for branch, frame in found.items():
+            if branch not in references:
+                references[branch] = frame
+            else:
+                reference = references[branch]
+                keep = pd.MultiIndex.from_frame(reference[KEYS]).isin(pd.MultiIndex.from_frame(frame[KEYS]))
+                reference = reference.loc[keep].reset_index(drop=True)
+                if reference.empty:
+                    raise ValueError(f"{branch}: 모든 입력에 공통인 예측 행이 없습니다.")
+                keys = pd.MultiIndex.from_frame(reference[KEYS])
+                align_rows(frame.set_index(KEYS).loc[keys].reset_index(), reference)
+                references[branch] = reference
+            records.append({"source_workbook": str(source), "source_sha256": source_hash,
+                            "branch": branch, "original_rows": len(frame)})
+        print(f"공통 행 확인: {source.parent.name} " +
+              ", ".join(f"{k} {len(v):,}행" for k, v in found.items()), flush=True)
+    alignment = pd.DataFrame(records)
+    alignment["common_rows"] = alignment.branch.map({k: len(v) for k, v in references.items()})
+    alignment["excluded_rows"] = alignment.original_rows - alignment.common_rows
+    print("최종 공통 행: " + ", ".join(f"{k} {len(v):,}행" for k, v in references.items()), flush=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if output:
+        root = Path(output).expanduser().resolve()
+        if root.exists():
+            raise FileExistsError(f"새 출력 폴더를 지정하세요: {root}")
+        destinations = [root / source.parent.name for source in sources]
+    else:
+        destinations = [source.parent / f"organized_common_{stamp}_id-tol-{id_tolerance}" for source in sources]
+    if len(set(destinations)) != len(destinations) or any(p.exists() for p in destinations):
+        raise ValueError("출력 폴더가 중복됩니다. 입력 Excel을 서로 다른 폴더에 두세요.")
+    return [organize_workbook(source, destination, regions, id_tolerance,
+                              common_references=references, alignment=alignment)
+            for source, destination in zip(sources, destinations)]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", help="이 프로젝트에서 생성한 predictions.xlsx 경로")
-    parser.add_argument("--output", help="새 출력 폴더. 생략하면 입력 파일 옆 organized_날짜_시간_id-tol-N")
+    parser.add_argument("input", nargs="+", help="predictions.xlsx 경로 또는 와일드카드. 여러 파일이면 공통 행으로 비교")
+    parser.add_argument("--output", help="새 출력 폴더. 여러 입력이면 그 아래 입력 폴더별 저장. 생략하면 각 입력 옆 organized_[common_]날짜_시간_id-tol-N")
     parser.add_argument("--regions", default=DEFAULT_REGIONS, help="고정 구간. 기본: %(default)s")
     parser.add_argument("--id-tolerance", type=int, choices=range(18), default=2,
                         help="±n ID 허용 거리(0–17). 0은 정확 ID 일치. 기본: %(default)s")
     args = parser.parse_args(argv)
     try:
-        destination = organize_workbook(args.input, args.output, args.regions, args.id_tolerance)
+        sources = []
+        for pattern in args.input:
+            expanded = str(Path(pattern).expanduser())
+            matches = sorted(glob.glob(expanded)) if glob.has_magic(expanded) else [expanded]
+            if not matches:
+                raise ValueError(f"일치하는 입력 Excel이 없습니다: {pattern}")
+            sources.extend(matches)
+        destinations = organize_workbooks(sources, args.output, args.regions, args.id_tolerance)
     except (ValueError, AssertionError, KeyError, OSError, zipfile.BadZipFile) as error:
         parser.exit(1, f"결과 정리 실패: {error}\n")
-    print(f"결과 정리 완료: {destination}")
+    for destination in destinations:
+        print(f"결과 정리 완료: {destination}")
 
 
 if __name__ == "__main__":

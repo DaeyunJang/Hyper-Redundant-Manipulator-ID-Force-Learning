@@ -690,19 +690,13 @@ def export_validation_workbook(train_dir: str | Path) -> Path:
     return path
 
 
-def _frozen_test_trials(bundle: dict, check_overlap: bool = False) -> list:
-    known = _known_trials(bundle)
-    saved = [known[index] for index in bundle.get("split", {}).get("test", [])]
-    if not saved:
-        raise ValueError("Bundle has no saved test files")
-    paths = [_path(item["path"], bundle) for item in saved]
+def _test_trials(bundle: dict, check_overlap: bool = False) -> list:
+    """현재 test 폴더의 CSV 전체를 저장된 전처리·교정 기준으로 읽습니다."""
+    directory = _path(bundle["config"].get("test_directory", "datasets/test"), bundle)
+    paths = sorted(path for path in directory.glob("*.csv") if path.is_file())
+    if not paths:
+        raise ValueError(f"No CSV files found in test directory: {directory}")
     trials = load_prediction_trials(paths, bundle["config"], bundle["calibration"])
-    expected = {str(path): item["sha256"] for path, item in zip(paths, saved)}
-    if len(trials) != len(saved):
-        raise ValueError("Frozen test file count changed")
-    for trial in trials:
-        if expected.get(str(Path(trial.path).resolve())) != trial.sha256:
-            raise ValueError(f"Frozen test CSV changed since training: {trial.path}")
     if check_overlap:
         _warn_prediction_overlap(trials, bundle)
     return trials
@@ -745,7 +739,9 @@ def select_and_evaluate(train_dir: str | Path, output: str | Path | None = None,
     _assert_bundle_row(reference, comparison.iloc[0])
     signature = _contract(reference)
     jobs = representative_comparison_rows(comparison, reference["config"])
-    trials = _frozen_test_trials(reference, check_overlap=check_overlap)
+    trials = _test_trials(reference, check_overlap=check_overlap)
+    test_directory = _path(reference["config"].get("test_directory", "datasets/test"), reference)
+    print(f"Test CSV: {len(trials)} files in {test_directory}", flush=True)
     destination = fresh_directory("predict", output)
     writer = ModelWorkbook(destination / "predictions.xlsx", comparison)
     reports, selected_reports, selections, updates = {}, {}, [], {}
@@ -815,6 +811,8 @@ def select_and_evaluate(train_dir: str | Path, output: str | Path | None = None,
         "completed_combinations_evaluated": len(comparison),
         "comparison_csv": "comparison.csv", "predictions_csv": "predictions.csv", "workbook": "predictions.xlsx",
         "representative_policy": REPRESENTATIVE_POLICY,
+        "test_file_policy": "all_csv_in_current_test_directory",
+        "test_directory": str(test_directory), "test_csv_count": len(trials),
         "test_evaluation_scope": reference["config"].get("test_evaluation_scope", "historical_held_out_recordings"),
     })
     write_json(destination / "input_manifest.json", [trial.info for trial in trials])

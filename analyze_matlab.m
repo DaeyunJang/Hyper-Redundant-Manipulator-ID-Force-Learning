@@ -6,12 +6,12 @@ clear; clc;
 
 %% 1) 설정: 빈 경로는 실행 시 파일 선택 창을 엽니다.
 force_file = "";  % force-estimation_class0_...xlsx 또는 loss-mask 파일
-force_source = "summary_18_test_2.csv"; % ""이면 Excel의 모든 실험 합산
+force_source = "";                    % 기본: 선택 Excel의 모든 실험. 특정 CSV만 보려면 파일명 지정
 force_load = "all";                    % "all", "loaded", "unloaded"
 make_id_plots = false;                 % ID 그래프도 그리려면 true
 id_file = "";                         % id-estimation_all-models_...xlsx
 id_model = "transformer";              % 두 방식에서 비교할 동일 모델 열 이름
-id_range = 1:17;                       % body: 1:17, tip 포함: 1:18
+id_range = 1:18;                       % 기본: tip 포함 전체 ID. body만 보려면 1:17
 tolerances = 0:5;                      % 0=정확ID. ±2/±3 모두 여기서 계산
 
 %% 2) 힘: 모델 열을 자동 탐색하고 각 모델의 XYZ 공통 유효 행으로 계산

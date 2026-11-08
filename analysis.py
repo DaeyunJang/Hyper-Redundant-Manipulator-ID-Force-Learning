@@ -1,4 +1,4 @@
-"""저장된 predict 결과 → 힘/ID 비교 Excel + 그림. 학습·추론·원본 CSV 재로딩 없음.
+"""저장된 predict 결과 → 힘/ID 지표·조합별 GT/예측 통합 Excel + 그림. 학습·추론·원본 CSV 재로딩 없음.
 
 bash scripts/hrm_python.sh analysis.py results/predict/실행폴더
 bash scripts/hrm_python.sh analysis.py 'results/predict/날짜시간_*'
@@ -20,6 +20,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import xlsxwriter
+
+from organize_results import WorkbookReader, KEYS, align_rows, force_tables
 
 
 AXES = ("fx", "fy", "fz", "xyz")
@@ -109,6 +112,169 @@ def identifier(row: dict) -> str:
     return f"{row['mode']}__force_{row['force_model']}__location_{row['location_model']}"
 
 
+def input_name(folder: Path) -> str:
+    # 사용자가 폴더를 날짜만 남겨 정리한 경우도 같은 입력으로 연결한다.
+    return re.sub(r"^\d{8}_(?:\d{6}_)?", "", folder.name) or folder.name
+
+
+def _force_series_sources(folder: Path) -> list[dict]:
+    """현재 predictions와 연결된 organized를 읽고, 없으면 저장된 힘 시트를 사용합니다."""
+    source = folder / "predictions.xlsx"
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest = json.loads((folder / "workbook_manifest.json").read_text())
+    if manifest.get("sha256") != source_hash:
+        raise ValueError(f"predictions.xlsx와 workbook_manifest의 SHA256이 다릅니다: {folder}")
+    models = pd.DataFrame(manifest["model_sheets"])
+    models = models.loc[models.branch.eq("force") & models.rows.gt(0)].copy()
+    if models.empty or models.duplicated(["mode", "model"]).any():
+        raise ValueError(f"대표 힘 모델이 없거나 중복됐습니다: {folder}")
+    if not models.force_unit.eq("mN").all():
+        raise ValueError(f"힘 Excel 단위는 mN이어야 합니다: {folder}")
+    modes = models["mode"].unique().tolist()
+    organized = None
+    candidates = sorted(folder.glob("organized_*"), key=lambda p: re.sub(
+        r"^organized_(?:common_)?", "", p.name), reverse=True)
+    for directory in candidates:
+        books = {}
+        for mode in modes:
+            label = "loss-mask" if mode == "masked" else mode
+            paths = list(directory.glob(f"force-estimation_{label}_id-tol-*_results.xlsx"))
+            if len(paths) != 1:
+                break
+            reader = WorkbookReader(paths[0])
+            try:
+                if not {"_guide", "_models", "_rows", *AXES[:3]}.issubset(reader.sheets):
+                    break
+                guide = dict(reader.read("_guide").itertuples(index=False, name=None))
+                matches = guide.get("입력 SHA256") == source_hash
+            finally:
+                reader.close()
+            if not matches:
+                break
+            books[mode] = paths[0]
+        if len(books) == len(modes):
+            organized = books
+            break
+    result = []
+    for mode in modes:
+        selected = models.loc[models["mode"].eq(mode)].copy()
+        path = organized[mode] if organized else source
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        reader = WorkbookReader(path)
+        try:
+            if organized:
+                rows = reader.read("_rows")
+                axes = {axis: reader.read(axis) for axis in AXES[:3]}
+                saved_models = reader.read("_models")
+                saved_models = saved_models.loc[saved_models.branch.eq("force") & saved_models["mode"].eq(mode)]
+                for model in selected.itertuples():
+                    saved = saved_models.loc[saved_models.model.eq(model.model)]
+                    if (len(saved) != 1 or saved.iloc[0].checkpoint_sha256 != model.checkpoint_sha256
+                            or saved.iloc[0].fixed_partner != model.fixed_partner):
+                        raise ValueError(f"organized 대표 힘 모델 정보가 다릅니다: {path} / {model.model}")
+            else:
+                reference, frames = None, {}
+                for model in selected.itertuples():
+                    frame = reader.read(model.sheet)
+                    reference = frame if reference is None else reference
+                    frames[model.model] = align_rows(frame, reference)
+                tables = force_tables(frames, reference)
+                rows, axes = tables["_rows"], {axis: tables[axis] for axis in AXES[:3]}
+        finally:
+            reader.close()
+        if hashlib.sha256(path.read_bytes()).hexdigest() != before:
+            raise ValueError(f"읽는 중 힘 Excel이 변경됐습니다: {path}")
+        expected = selected.model.tolist()
+        for axis, table in axes.items():
+            if len(table) != len(rows) or list(table) != [f"gt_{axis}_mN", *expected]:
+                raise ValueError(f"힘 시트와 원본 행/모델 목록이 다릅니다: {path} / {axis}")
+            if not np.isfinite(table.to_numpy(dtype=float)).all():
+                raise ValueError(f"힘 GT/예측에 비수치 값이 있습니다: {path} / {axis}")
+        if (rows[KEYS].isna().any().any() or rows.duplicated(KEYS).any()
+                or not np.isfinite(rows.source_row.to_numpy(float)).all()
+                or not rows.source_row.eq(np.floor(rows.source_row)).all() or rows.source_row.lt(0).any()):
+            raise ValueError(f"원본 파일/행 키가 없거나 중복/비정수입니다: {path}")
+        result.append({"mode": mode, "models": selected, "rows": rows, "axes": axes,
+                       "source_workbook": str(path), "source_sha256": before,
+                       "predictions_sha256": source_hash,
+                       "source_kind": "organized" if organized else "predictions"})
+    if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+        raise ValueError(f"읽는 중 predictions.xlsx가 변경됐습니다: {folder}")
+    return result
+
+
+def combined_force_tables(folders: list[Path], force_files=()) -> dict:
+    """입력·방식·대표 모델을 열로 모읍니다. 실제 원본 행 교집합에서만 GT를 공유합니다."""
+    entries, reference = [], None
+    names = [input_name(folder) for folder in folders]
+    for folder, name in zip(folders, names):
+        prefix = folder.name if names.count(name) > 1 else name
+        for item in _force_series_sources(folder):
+            rows, axes = item["rows"], item["axes"]
+            item["original_rows"] = len(rows)
+            if force_files:
+                keep = rows.source_file.map(lambda p: Path(p).name).isin(force_files)
+                rows = rows.loc[keep].reset_index(drop=True)
+                axes = {axis: frame.loc[keep].reset_index(drop=True) for axis, frame in axes.items()}
+            # Excel의 표시 행 번호가 아니라 원 CSV의 파일/행을 기준으로 맞춥니다.
+            truth = rows.drop(columns=["excel_row"]).copy()
+            for axis, frame in axes.items():
+                truth[f"gt_{axis}_mN"] = frame[f"gt_{axis}_mN"].to_numpy()
+            truth = truth.set_index(KEYS)
+            if reference is None:
+                reference = truth
+            else:
+                common = reference.index[reference.index.isin(truth.index)]
+                reference = reference.loc[common]
+                try:
+                    pd.testing.assert_frame_equal(truth.loc[common, reference.columns], reference,
+                                                  check_dtype=False, check_exact=True)
+                except AssertionError as exc:
+                    raise ValueError(f"같은 원본 행의 GT/ID/부하 정보가 다릅니다: {folder} / {item['mode']}") from exc
+            if reference.empty:
+                raise ValueError("모든 입력/방식에 공통인 힘 예측 행이 없습니다.")
+            item.update(run=str(folder), input=name, prefix=prefix, rows=rows, axes=axes)
+            entries.append(item)
+        print(f"힘 시계열 읽음: {folder.name}", flush=True)
+    if not entries:
+        raise ValueError("힘 시계열을 합칠 predict 폴더가 없습니다.")
+    common = reference.index
+    values = {axis: {f"gt_{axis}_mN": reference[f"gt_{axis}_mN"].to_numpy(float)} for axis in AXES[:3]}
+    columns, alignment, scores = [], [], []
+    for item in entries:
+        positions = pd.MultiIndex.from_frame(item["rows"][KEYS]).get_indexer(common)
+        alignment.append({"input": item["input"], "mode": item["mode"], "run": item["run"],
+                          **{key: item[key] for key in ("source_workbook", "source_sha256", "predictions_sha256", "source_kind", "original_rows")},
+                          "filtered_rows": len(item["rows"]), "common_rows": len(common),
+                          "excluded_rows": item["original_rows"] - len(common)})
+        for model in item["models"].to_dict("records"):
+            column = f"{item['prefix']}_{item['mode']}_{model['model']}_mN"
+            if column in values["fx"]:
+                raise ValueError(f"힘 예측 열 이름이 중복됩니다: {column}")
+            errors = []
+            score = {"column": column, "input": item["input"], "mode": item["mode"],
+                     "model": model["model"], "n": len(common)}
+            for axis in AXES[:3]:
+                prediction = item["axes"][axis][model["model"]].to_numpy(float)[positions]
+                values[axis][column] = prediction
+                error = prediction - values[axis][f"gt_{axis}_mN"]
+                errors.append(error)
+                score[f"rmse_{axis}_mN"] = float(np.sqrt(np.mean(error ** 2)))
+                score[f"mae_{axis}_mN"] = float(np.mean(np.abs(error)))
+            error = np.column_stack(errors)
+            score.update(rmse_xyz_mN=float(np.sqrt(np.mean(error ** 2))), mae_xyz_mN=float(np.mean(np.abs(error))))
+            scores.append(score)
+            columns.append({**model, "column": column, "input": item["input"], "run": item["run"],
+                            "source_workbook": item["source_workbook"]})
+    rows = reference.drop(columns=[f"gt_{axis}_mN" for axis in AXES[:3]]).reset_index()
+    rows.insert(0, "excel_row", np.arange(len(rows)) + 2)
+    result = {axis: pd.DataFrame(data) for axis, data in values.items()}
+    result.update(force_rows=rows, force_columns=pd.DataFrame(columns),
+                  force_alignment=pd.DataFrame(alignment), force_common_metrics=pd.DataFrame(scores))
+    print(f"통합 힘 시계열: {len(rows):,}행, 축당 GT 1열 + 예측 {len(columns)}열", flush=True)
+    return result
+
+
 def choose_models(comparison: pd.DataFrame, summary: dict, reports: dict) -> tuple[set, set]:
     # Force는 predict가 저장한 validation 선택을 그대로 사용한다.
     force = {identifier(row) for row in summary["best_by_mode"].values()}
@@ -143,7 +309,7 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
     if len(scopes) != 1:
         raise ValueError("한 실행의 force_scope가 일관되지 않습니다.")
     force_scope = scopes.pop()
-    name = re.sub(r"^\d{8}_\d{6}_?", "", folder.name) or folder.name
+    name = input_name(folder)
     run = str(folder)
     base = {"run": run, "input": name, "force_scope": force_scope}
     trial_map = {item["path"]: item for item in inputs}
@@ -215,6 +381,8 @@ def analyze_run(folder: Path, force_files: list[str], tolerances: list[int], tab
 
 def guide(force_files: list[str], tolerances: list[int]) -> pd.DataFrame:
     return pd.DataFrame([
+        ("먼저 볼 시트", "force_body_summary / id_body_summary: body 요약. force_file_detail: 선택한 별도 힘 파일. --previous 사용 시 force_file_comparison: 이전/현재 비교."),
+        ("MATLAB", "plot_analysis.m에서 이 Excel 하나만 선택. 여러 predict 폴더는 이미 이 파일 안에 합쳐져 있으므로 별도 Excel 병합이 필요 없음."),
         ("단위", "힘 mN, 정확도 %, n은 평가행 수. 빈 셀은 평가 불가이며 0 오차/0%가 아님."),
         ("힘 범위", "저장된 force_scope 사용. tip 학습의 body는 N=0. all_single_contact는 각 접촉점의 실측 힘을 평가."),
         ("힘 평가 파일", ", ".join(force_files) or "저장된 전체 test 파일. 특정 독립 실험만 보려면 --force-file 사용."),
@@ -232,31 +400,133 @@ def guide(force_files: list[str], tolerances: list[int]) -> pd.DataFrame:
         ("상세 및 대표모델", "force_by_file/force_by_id/id_by_id는 validation 선택 + organized와 동일한 고정 파트너 대표분기. representative_* 열로 선택."),
         ("혼동행렬", "ID validation 선택 모델. GT0 행은 Class0 무부하 전체; body/tip 무부하별 통계는 detection 시트."),
         ("ID 파일 범위", "ID는 모든 저장 test를 평가. --force-file은 힘 분석에만 적용; 저장 혼동행렬만으로 임의 파일별 ±n는 계산 불가."),
-        ("비교 해석", "입력별 N과 학습 자료가 다를 수 있음. 공통행 비교/독립 세션 판정/중복 제거/여러 seed 통계는 수행하지 않음."),
-        ("원자료", "행별 GT/예측은 기존 predictions.xlsx 및 organized Excel 사용. 이 파일은 집계 결과이며 모델을 다시 실행하지 않음."),
-        ("추가 진단", "힘 크기별 ID 정확도, 공통 끝행 비교, 시계열 그림은 이 코드 범위 밖. 원본 행별 예측과 별도 분석이 필요."),
+        ("비교 해석", "기존 집계/그림의 입력별 N과 학습 자료가 다를 수 있음. fx/fy/fz는 원본 끝행 교집합으로 비교하지만 입력창 전체 이력이나 학습 자료까지 맞추지는 않음."),
+        ("행별 힘 비교", "fx/fy/fz: 공통 GT 1열 + 입력조합_방식_힘모델_mN 예측 열. Masked/Class0 모두 포함. force_rows로 원CSV/행/ID를 찾고 force_columns에서 실제 checkpoint와 위치 파트너 확인."),
+        ("시계열의 출처", "현재 predictions.xlsx hash에 연결된 최신 organized 힘 Excel을 읽음. organized가 없거나 오래됐으면 저장 predictions.xlsx의 대표 힘 시트 사용. 학습/추론/보간/재라벨 없음."),
+        ("공통행 힘 지표", "force_common_metrics는 fx/fy/fz의 동일 공통행에서 재계산한 대표 힘 모델 RMSE/MAE. force_alignment에 입력/방식별 사용 원Excel/hash/행 수 기록. 기존 전체 조합 집계 및 그림의 분모는 바꾸지 않음."),
+        ("대표 힘 모델 범위", "행별 비교는 입력별 2방식×11힘모델 등 predictions.xlsx에 저장된 대표 분기. 모든 힘×위치 조합의 행별 예측을 의미하지 않으며 validation 최선모델과 다를 수 있음."),
+        ("이전 비교", "--previous는 동일 입력명/방식/파일을 연결. predictions.csv의 평가 원행·GT·부하별 집합과 파일 hash가 같을 때만 오차 차이를 표시. 시간창 이력/학습자료/선택모델까지 통제한 인과 비교는 아님."),
+        ("추가 진단", "힘 크기별 ID 정확도와 시계열 그래프는 별도 분석. fx/fy/fz의 공통행 힘 예측은 이 Excel에서 바로 그래프로 그릴 수 있음."),
     ], columns=["항목", "설명"])
 
 
+def force_file_results(folder: Path, filename: str, experiment: str, sources: list) -> list[dict]:
+    """별도 힘 시험의 validation 선택 모델. 이전/현재 비교용 행·GT 지문도 보존한다."""
+    reports = read_json(folder / "metrics.json", sources)["all_combinations"]
+    summary = read_json(folder / "summary.json", sources)
+    inputs = read_json(folder / "input_manifest.json", sources)
+    files = [item for item in inputs if Path(item["path"]).name == filename]
+    if not files:
+        print(f"별도 힘 파일 생략: {folder.name} / {filename} 없음", flush=True)
+        return []
+    if len(files) != 1:
+        raise ValueError(f"동일 이름의 시험 파일이 여러 개입니다: {folder} / {filename}")
+    trial = files[0]
+    csv = folder / "predictions.csv"
+    rows = None
+    if csv.exists():
+        sources.append({"path": str(csv), "sha256": hashlib.sha256(csv.read_bytes()).hexdigest()})
+        columns = ["source_file", "source_row", "mode", "force_model", "location_model", "load_state_gt"]
+        columns += [f"{kind}_{axis}_N" for kind in ("true", "pred") for axis in AXES[:3]]
+        rows = pd.read_csv(csv, usecols=columns)
+        rows = rows[rows.source_file.eq(trial["path"])]
+    result = []
+    for mode, chosen in summary["best_by_mode"].items():
+        metrics = reports[identifier(chosen)]["files"][trial["path"]]
+        for state in STATES:
+            score = pool_force([metrics], state)
+            fingerprint = ""
+            if rows is not None:
+                part = rows[rows["mode"].eq(mode)]
+                if not (part.force_model.eq(chosen["force_model"]) & part.location_model.eq(chosen["location_model"])).all():
+                    raise ValueError(f"predictions.csv와 summary의 선택 모델이 다릅니다: {folder}")
+                numeric = [f"{kind}_{axis}_N" for kind in ("true", "pred") for axis in AXES[:3]]
+                part = part[np.isfinite(part[numeric].to_numpy(dtype=float)).all(axis=1)]
+                if state != "all":
+                    part = part[part.load_state_gt.eq(state)]
+                part = part.sort_values("source_row")
+                if len(part) != score["n"] or part.source_row.duplicated().any():
+                    raise ValueError(f"힘 평가행 수/중복이 저장 지표와 맞지 않습니다: {folder} / {mode} / {state}")
+                data = part[["source_row", "true_fx_N", "true_fy_N", "true_fz_N"]].to_numpy(dtype="<f8")
+                fingerprint = hashlib.sha256(data.tobytes()).hexdigest() if len(part) else ""
+            result.append({"input": input_name(folder), "run": str(folder), "experiment": experiment,
+                           "mode": mode, "force_model": chosen["force_model"], "location_model": chosen["location_model"],
+                           "file": filename, "load_state": state, **score, "source_sha256": trial["sha256"],
+                           "evaluation_rows_gt_sha256": fingerprint})
+    return result
+
+
+def add_summaries(frames: dict, folders: list[Path], previous: list[Path], filename: str) -> dict:
+    """기존 상세표를 유지하고 읽기 쉬운 요약/동일 파일 전후 비교를 앞에 둔다."""
+    extra = {"force_body_summary": frames["force_selected"].query("group == 'body'").copy(),
+             "id_body_summary": frames["id_selected"].query("group == 'body'").copy()}
+    sources, rows = [], []
+    for experiment, paths in (("current", folders), ("previous", previous)):
+        for folder in paths:
+            rows.extend(force_file_results(folder, filename, experiment, sources))
+    if rows:
+        detail = pd.DataFrame(rows)
+        extra["force_file_detail"] = detail
+        if previous:
+            keys = ["input", "mode", "file", "load_state"]
+            current = detail[detail.experiment.eq("current")]
+            old = detail[detail.experiment.eq("previous")]
+            if current.duplicated(keys).any() or old.duplicated(keys).any():
+                raise ValueError("이전 비교는 입력당 한 실행씩 지정하세요. 동일 입력 이름의 실행이 여러 개입니다.")
+            joined = current.merge(old, on=keys, suffixes=("_new", "_old"), how="inner", validate="one_to_one")
+            if joined.empty:
+                raise ValueError("이전/현재에 동일 입력명·방식·별도 힘 파일이 없습니다.")
+            joined["same_evaluation_rows_gt"] = (joined.source_sha256_new.eq(joined.source_sha256_old) &
+                joined.evaluation_rows_gt_sha256_new.ne("") &
+                joined.evaluation_rows_gt_sha256_new.eq(joined.evaluation_rows_gt_sha256_old) &
+                joined.n_new.eq(joined.n_old))
+            for metric in ("rmse", "mae"):
+                for axis in AXES:
+                    col = f"{metric}_{axis}_mN"
+                    joined[col + "_delta_new_minus_old"] = (joined[col + "_new"] - joined[col + "_old"]).where(joined.same_evaluation_rows_gt)
+            extra["force_file_comparison"] = joined
+    frames["sources"] = pd.concat([frames["sources"], pd.DataFrame(sources)], ignore_index=True).drop_duplicates("path")
+    return {"guide": frames["guide"], **extra, **{key: value for key, value in frames.items() if key != "guide"}}
+
+
 def write_excel(tables: dict, destination: Path) -> None:
-    options = {"strings_to_formulas": False, "strings_to_urls": False}
-    with pd.ExcelWriter(destination, engine="xlsxwriter", engine_kwargs={"options": options}) as writer:
+    # 행별 힘 예측 수백만 셀을 메모리에 쌓지 않고 한 행씩 저장합니다.
+    options = {"constant_memory": True, "strings_to_formulas": False, "strings_to_urls": False}
+    with xlsxwriter.Workbook(destination, options) as book:
+        book.use_zip64()
+        header = book.add_format({"bold": True, "text_wrap": True, "bg_color": "#173D59", "font_color": "white"})
+        number = book.add_format({"num_format": "0.000000"})
         for name, frame in tables.items():
+            if len(frame) >= 1048576 or len(frame.columns) > 16384:
+                raise ValueError(f"{name}: Excel 시트 크기를 초과했습니다.")
             # 점수는 왼쪽에, 긴 원본 경로와 선택 여부 등 출처 정보는 오른쪽에 둔다.
             preferred = ["input", "mode", "force_model", "location_model", "group", "load_state", "contact_id", "gt_id", "n", "n_loaded"]
             preferred += [f"{metric}_{axis}_mN" for metric in ("rmse", "mae") for axis in AXES]
             preferred += [column for column in frame.columns if column.startswith(("accuracy_tol", "macro_tol"))]
             front = [column for column in preferred if column in frame.columns]
             frame = frame[front + [column for column in frame.columns if column not in front]]
-            frame.to_excel(writer, sheet_name=name, index=False)
-            sheet = writer.sheets[name]
-            sheet.freeze_panes(1, 0)
+            sheet = book.add_worksheet(name)
+            sheet.write_row(0, 0, list(frame), header)
+            sheet.set_row(0, 60 if name in AXES[:3] else 32)
+            sheet.freeze_panes(1, 1 if name in AXES[:3] else 0)
+            for index, row in enumerate(frame.itertuples(index=False, name=None), 1):
+                values = []
+                for value in row:
+                    if isinstance(value, (list, tuple, dict)):
+                        value = json.dumps(value, ensure_ascii=False)
+                    elif isinstance(value, np.generic):
+                        value = value.item()
+                    if pd.isna(value):
+                        value = None
+                    values.append(value)
+                sheet.write_row(index, 0, values)
             if len(frame):
                 sheet.autofilter(0, 0, len(frame), len(frame.columns) - 1)
-            sheet.set_column(0, len(frame.columns) - 1, 19)
+            sheet.set_column(0, len(frame.columns) - 1, 28 if name in AXES[:3] else 19,
+                             number if name in AXES[:3] else None)
             if name == "guide":
                 sheet.set_column(0, 0, 22)
-                sheet.set_column(1, 1, 115, writer.book.add_format({"text_wrap": True}))
+                sheet.set_column(1, 1, 115, book.add_format({"text_wrap": True}))
             else:
                 for index, column in enumerate(frame.columns):
                     if column in ("run", "file", "path", "checkpoint", "input_columns"):
@@ -349,27 +619,79 @@ def plot_confusions(matrices: list, output: Path) -> None:
         plt.close(fig)
 
 
+def plot_force_details(tables: dict, output: Path) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12), constrained_layout=True)
+    for ax, state in zip(axes.flat, ("all", "loaded")):
+        data = tables["force_body_summary"].query("load_state == @state")
+        labels = [f"{INPUT_NAMES.get(r.input, r.input)}\n{r.mode} / N={r.n:,}" for r in data.itertuples()]
+        ax.bar(np.arange(len(data)), data.rmse_xyz_mN)
+        ax.set_xticks(np.arange(len(data)), labels, rotation=50, ha="right", fontsize=8)
+        ax.set_title(f"Body force / {state} GT rows")
+    ax = axes[1, 0]
+    detail = tables.get("force_file_detail", pd.DataFrame())
+    if not detail.empty:
+        data = detail.query("experiment == 'current' and load_state == 'all'")
+        ax.bar(np.arange(len(data)), data.rmse_xyz_mN)
+        labels = [f"{INPUT_NAMES.get(r.input, r.input)}\n{r.mode} / N={r.n:,}" for r in data.itertuples()]
+        ax.set_xticks(np.arange(len(data)), labels, rotation=50, ha="right", fontsize=8)
+        ax.set_title("Separate force file: " + str(detail.file.iloc[0]))
+    else:
+        ax.set_title("Separate force file: unavailable")
+    ax = axes[1, 1]
+    comparison = tables.get("force_file_comparison", pd.DataFrame())
+    if not comparison.empty:
+        data = comparison.query("load_state == 'all' and same_evaluation_rows_gt")
+        x = np.arange(len(data))
+        ax.bar(x - .18, data.rmse_xyz_mN_old, .36, label="Previous")
+        ax.bar(x + .18, data.rmse_xyz_mN_new, .36, label="Current")
+        labels = [f"{INPUT_NAMES.get(r.input, r.input)}\n{r.mode} / N={r.n_new:,}" for r in data.itertuples()]
+        ax.set_xticks(x, labels, rotation=50, ha="right", fontsize=8)
+        ax.legend()
+        ax.set_title("Previous vs current / same force rows and GT")
+    else:
+        ax.text(.5, .5, "Previous comparison: use --previous", transform=ax.transAxes, ha="center")
+    for ax in axes.flat:
+        ax.set_ylabel("XYZ RMSE [mN]")
+        ax.grid(axis="y", alpha=.2)
+        ax.set_axisbelow(True)
+    fig.suptitle("Validation-selected force models | Body and separate force file\nN differs across inputs; missing support is not zero error")
+    fig.savefig(output / "body_force_and_tip_comparison.png", dpi=180)
+    plt.close(fig)
+
+
+def expand_folders(patterns: list[str]) -> list[Path]:
+    folders = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(str(Path(pattern).expanduser())))
+        if not matches:
+            raise ValueError(f"결과 폴더를 찾을 수 없습니다: {pattern}")
+        for path in matches:
+            folder = Path(path).resolve()
+            if not (folder / "metrics.json").is_file():
+                raise ValueError(f"metrics.json이 있는 predict 실행 폴더를 지정하세요: {folder}")
+            if folder not in folders:
+                folders.append(folder)
+    return folders
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("predict_dirs", nargs="+", help="predict 결과 폴더 하나/여러 개 또는 따옴표로 감싼 glob")
     parser.add_argument("--output", type=Path, help="새 분석 폴더; 기본 results/analysis/날짜시간_comparison")
     parser.add_argument("--force-file", nargs="+", default=[], help="힘 평가에 포함할 CSV 파일명. 생략하면 전체 test; ID 평가는 전체 유지")
     parser.add_argument("--id-tolerances", nargs="+", type=int, default=[2, 3], help="기본 2 3; 정확 ID(0)와 ±1도 항상 계산")
+    parser.add_argument("--previous", nargs="+", default=[], help="선택: 이전 predict 폴더/glob. 동일 입력의 별도 힘 파일 전후 비교")
+    parser.add_argument("--comparison-force-file", default="summary_18_test_2.csv",
+                        help="별도 힘 시험 시트/그림에 사용할 파일명. 기본 summary_18_test_2.csv; --force-file 집계 필터와 별개")
     args = parser.parse_args()
     if any(n < 0 or n > 17 for n in args.id_tolerances):
         parser.error("ID tolerance는 0–17이어야 합니다.")
     tolerances = sorted({0, 1, *args.id_tolerances})
-    folders = []
-    for pattern in args.predict_dirs:
-        matches = sorted(glob.glob(str(Path(pattern).expanduser())))
-        if not matches:
-            parser.error(f"결과 폴더를 찾을 수 없습니다: {pattern}")
-        for path in matches:
-            folder = Path(path).resolve()
-            if not (folder / "metrics.json").is_file():
-                parser.error(f"metrics.json이 있는 predict 실행 폴더를 지정하세요: {folder}")
-            if folder not in folders:
-                folders.append(folder)
+    try:
+        folders = expand_folders(args.predict_dirs)
+        previous = expand_folders(args.previous)
+    except ValueError as exc:
+        parser.error(str(exc))
     stamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d_%H%M%S_%f")
     output = (args.output or Path("results/analysis") / (stamp + "_comparison")).resolve()
     if output.exists():
@@ -378,12 +700,21 @@ def main() -> None:
     for folder in folders:
         analyze_run(folder, args.force_file, tolerances, tables, matrices)
     frames = {"guide": guide(args.force_file, tolerances), **{name: pd.DataFrame(rows) for name, rows in tables.items()}}
+    frames = add_summaries(frames, folders, previous, args.comparison_force_file)
+    series = combined_force_tables(folders, args.force_file)
+    frames = {"guide": frames["guide"], **series, **{name: frame for name, frame in frames.items() if name != "guide"}}
+    source_rows = series["force_alignment"][["source_workbook", "source_sha256"]].rename(
+        columns={"source_workbook": "path", "source_sha256": "sha256"})
+    frames["sources"] = pd.concat([frames["sources"], source_rows], ignore_index=True).drop_duplicates("path")
     output.mkdir(parents=True)
     write_excel(frames, output / "force_and_id_all_combinations.xlsx")
     plot_summary(frames, output, tolerances)
     plot_confusions(matrices, output)
+    plot_force_details(frames, output)
     print(f"분석 완료: {output}")
-    print("Excel: force_selected / id_selected → 선택 모델, force / location → 전체 조합, *_by_id → ID별 결과")
+    print("fx/fy/fz: 공통 GT + 입력조합_방식_모델별 힘 예측. force_common_metrics: 같은 행의 RMSE/MAE")
+    print("Excel 하나: force_body_summary / id_body_summary → body, force_file_comparison → 이전 비교")
+    print("MATLAB: plot_analysis.m 실행 후 이 Excel 선택. 별도 Excel 병합 불필요.")
 
 
 if __name__ == "__main__":

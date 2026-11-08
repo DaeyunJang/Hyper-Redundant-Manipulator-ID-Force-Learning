@@ -1,16 +1,49 @@
-datasets
+# Publish only the CSV files used by configs/*.yaml.
+/datasets/*
+!/datasets/train/
+!/datasets/test/
+/datasets/train/*
+!/datasets/train/*.csv
+/datasets/test/*
+!/datasets/test/*.csv
 
-results/
-results_legacy_*/
+# Generated models, predictions and figures stay local.
+/results*/
+/runs/
+/checkpoints/
+*.pt
+*.pth
+*.onnx
+*.xlsx
+*.fig
+*.log
+
+# Local environments and caches.
+/env_hrm_force_estimation/
+/.venv/
+/venv/
+/.runtime/
 __pycache__/
+*.py[cod]
 .pytest_cache/
-*.pyc
-env_hrm_force_estimation/
-.runtime/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
 
-tests
-.agents
-.codex
-.vscode
-results*
+# Development tests, editor settings and working notes.
+/tests/
+/test_*.py
+/.agents/
+/.codex/
+/.vscode/
+/AGENTS.md
+/archive/
+/docs/CHATGPT_README.md
+/docs/PAPER_RESEARCH_REPORT.md
+/commands.txt
+/command_indiv.txt
+
+# Optional research tools requiring separately retained acquisition data.
+/find_similar_inputs.py
+/matlab_analysis/
 
