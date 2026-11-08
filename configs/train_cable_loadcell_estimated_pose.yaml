@@ -74,5 +74,5 @@ cudnn_benchmark: true      # GPU 연산 알고리즘의 속도를 측정해 선�
 
 # 학습 후 validation.xlsx 생성 여부. predict.py는 predictions.xlsx를 자동 생성합니다.
 export_excel: true
-test_evaluation_scope: user_partitioned_recording_blocks_and_legacy_id18_tests
+test_evaluation_scope: held_out_whole_recordings_per_contact_id
 
