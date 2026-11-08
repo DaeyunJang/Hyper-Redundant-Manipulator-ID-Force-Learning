@@ -23,10 +23,12 @@ bash scripts/setup_environment.sh
 
 | 데이터 경로 | CSV 수 | 크기 |
 |---|---:|---:|
-| `datasets/train/*.csv` | 58 | 약 3.57 GB |
-| `datasets/test/*.csv` | 1 | 약 66.65 MB |
+| `datasets/train/train1.csv` ~ `train58.csv` | 58 | 약 3.57 GB |
+| `datasets/test/test1.csv` | 1 | 약 66.65 MB |
 
-현재 test 파일은 `summary_static_pan_-30to+30_tilt_-30to+30_interval-15deg_seg-id-18_test.csv`입니다.
+파일 번호는 접촉 ID가 아닙니다. 라벨은 CSV의 `contact_segment_id`에서 읽습니다.
+원래 파일명·접촉 ID·SHA256은 [datasets/file_names.csv](datasets/file_names.csv)에 기록했습니다.
+현재 test 파일은 `test1.csv`입니다.
 **ID18 데이터 한 개이므로 전체 body 접촉 위치를 평가하는 테스트 세트가 아닙니다.**
 CSV 대신 몇 줄짜리 LFS 포인터만 보이면 `git lfs pull`을 다시 실행하세요.
 

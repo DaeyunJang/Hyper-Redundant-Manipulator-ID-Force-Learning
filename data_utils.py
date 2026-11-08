@@ -123,6 +123,15 @@ def _path(value, config):
     return path.resolve() if path.is_absolute() else (Path(config.get('project_root', ROOT)) / path).resolve()
 
 
+def csv_paths(directory):
+    """동일 접두사의 trainN/testN은 숫자순, 그 밖의 파일명은 기존 사전순으로 읽습니다."""
+    paths = sorted(path for path in Path(directory).glob('*.csv') if path.is_file())
+    matches = [re.fullmatch(r'(train|test)([0-9]+)', path.stem) for path in paths]
+    if matches and all(matches) and len({match.group(1) for match in matches}) == 1:
+        return [path for match, path in sorted(zip(matches, paths), key=lambda item: int(item[0].group(2)))]
+    return paths
+
+
 def input_columns(config):
     """학습·저장·예측에서 동일하게 사용하는 입력 열의 순서입니다."""
     columns = config.get('input_columns', config.get('feature_columns'))
@@ -372,7 +381,7 @@ def prepare_data(config, run_dir=None):
     excluded = []
     def discover(directory):
         selected = []
-        for path in sorted(directory.glob('*.csv')):
+        for path in csv_paths(directory):
             digest = sha256(path)
             rule = config.get('excluded_files_by_sha256', {}).get(digest)
             if rule:

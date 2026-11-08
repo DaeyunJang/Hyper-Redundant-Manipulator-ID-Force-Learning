@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from data_utils import (
-    ROOT, DEFAULT_REGIONS, ensure_driver_runtime, input_columns,
+    ROOT, DEFAULT_REGIONS, ensure_driver_runtime, input_columns, csv_paths,
     load_trial, load_prediction_trials, trial_endpoints,
     force_metrics, location_confusion, location_metrics,
     location_predictions, optimize_regions,
@@ -693,7 +693,7 @@ def export_validation_workbook(train_dir: str | Path) -> Path:
 def _test_trials(bundle: dict, check_overlap: bool = False) -> list:
     """현재 test 폴더의 CSV 전체를 저장된 전처리·교정 기준으로 읽습니다."""
     directory = _path(bundle["config"].get("test_directory", "datasets/test"), bundle)
-    paths = sorted(path for path in directory.glob("*.csv") if path.is_file())
+    paths = csv_paths(directory)
     if not paths:
         raise ValueError(f"No CSV files found in test directory: {directory}")
     trials = load_prediction_trials(paths, bundle["config"], bundle["calibration"])
@@ -831,7 +831,7 @@ def predict_checkpoint(checkpoint: str | Path, input_dir: str | Path,
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = Path(checkpoint).resolve()
     model, bundle = restore_bundle(checkpoint, device)
-    paths = sorted(Path(input_dir).resolve().glob("*.csv"))
+    paths = csv_paths(Path(input_dir).resolve())
     if not paths:
         raise ValueError(f"No CSV files found in {input_dir}")
     trials = load_prediction_trials(paths, bundle["config"], bundle["calibration"])

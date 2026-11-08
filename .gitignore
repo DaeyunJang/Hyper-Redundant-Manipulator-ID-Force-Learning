@@ -1,5 +1,6 @@
 # Publish only the CSV files used by configs/*.yaml.
 /datasets/*
+!/datasets/file_names.csv
 !/datasets/train/
 !/datasets/test/
 /datasets/train/*
